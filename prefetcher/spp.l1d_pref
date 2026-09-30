@@ -1,24 +1,548 @@
 #include "cache.h"
 
+/* ---------------- Configuration ---------------- */
+#define IP_TABLE_SIZE       64
+#define PATTERN_TABLE_SIZE  8
+#define SIG_STRIDES         4
+#define SIG_BITS            (4 * SIG_STRIDES)
+#define SIG_MASK            ((1u << SIG_BITS) - 1)
 
-void CACHE::l1d_prefetcher_initialize() 
+#define CONF_MAX            3
+#define PATTERN_CONF_TH     2
+#define UNIFORM_CONF_MAX    4      /* consniform */
+
+#define MAX_DEGREE          4
+#define MIN_DEGREE          1
+
+/* Predicted lines skipped before the first prefetch. Swept 0,1,2,4: 0 won,
+   because aiming further out both loses accuracy and pollutes the L1D. */
+#define PREFETCH_SKIP       0
+
+/* Degree k requires accuracy >= 25*(k-1)%, with HYST points of hysteresis so
+   the degree does not oscillate at a bounassified
+   (useful+useless) prefetches, not issued ones: only a few percent of issued
+   prefetches are ever classified, so gati*/
+#define THROTTLE_WINDOW     256
+#define ACC_STEP            25
+#define HYST                5
+
+#define FILTER_SIZE         32
+#define FILTER_EMPTY        0xFFFF
+
+/* ---------------- Storage widths (single-------- */
+#define B_VALID             1
+#define B_TAG               12
+#define B_LAST_CL           16
+#define B_CONST_STRIDE      7      /* |stride| <= 63 after the guard        */
+#define B_CONST_CONF        3
+#define B_LRU               6
+#define B_PAT_VICTIM        3
+#define B_PAT_STRIDE        4      /* only -8..7 is ever stored             */
+#define B_PAT_CONF          2
+#define B_SNAPSHOT          32
+#define B_DEGREE            3
+#define B_FILTER_HEAD       5
+
+/* ---------------- Helpers --------------
+
+/* A stride survives in the signature as 4 bits, so anything outside [-8,7]
+   is indistinguishable from something els */
+static inline bool sig_representable(int s
 {
-    std::cout << "------------------------------------------------" << std::endl;
+    return (stride >= -8) && (stride <= 7)
+}
+
+static inline uint16_t fold_signature(uint
+      cout << "Tracker bits: " << tracker_bits << endl;
+      cout << "Global bits: " << global_bits
+      cout << "Total storage bits: " << total_bits << endl;
+      cout << "Total storage bytes: " << (total_bits / 8.0) << endl;
+  }
+
+Doing this as a comments-only edit, then p
+Interrupted · What should Claude do instead?
+
+❯ #include "cache.h"
+
+  void CACHE::l1d_prefetcher_initialize()
+  {
+      std::cout << "------------------------------------------------" << std::endl;
+      std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+      std::cout << "------------------------------------------------" << std::endl;
+  }
+
+  void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+  {
+
+  }
+
+  void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+  {
+      return; //metadata_in;
+
+  void CACHE::l1d_prefetcher_final_stats()
+  {
+
+  } this was template code
+
+Good to know — the template uses std::cout, so I'll match that. Here's your code with the noise comments stripped, keeping only the ones that explain why (the handout does grade on comments, so I kept the non-obvious reasoning):
+
+  Ran 2 shell commands
+
+Compiles clean, same behavior, same 2057 B. Only non-comment change: cout → std::cout to match the template.
+
+#include "cache.h"
+
+/* ---------------- Configuration ---------------- */
+#define IP_TABLE_SIZE       64
+#define PATTERN_TABLE_SIZE  8
+#define SIG_STRIDES         4
+#define SIG_BITS            (4 * SIG_STRIDES)
+#define SIG_MASK            ((1u << SIG_BITS) - 1)
+
+#define CONF_MAX            3
+#define PATTERN_CONF_TH     2
+#define UNIFORM_CONF_MAX    4      /* consniform */
+
+#define MAX_DEGREE          4
+#define MIN_DEGREE          1
+
+/* Predicted lines skipped before the first prefetch. Swept 0,1,2,4: 0 won,
+   because aiming further out both loses accuracy and pollutes the L1D. */
+#define PREFETCH_SKIP       0
+
+/* Degree k requires accuracy >= 25*(k-1)%, with HYST points of hysteresis so
+   the degree does not oscillate at a boundary. The window counts classified
+   (useful+useless) prefetches, not issued ones: only a few percent of issued
+   prefetches are ever classified, so gating on issues never fires. */
+#define THROTTLE_WINDOW     256
+#define ACC_STEP            25
+#define HYST                5
+
+#define FILTER_SIZE         32
+#define FILTER_EMPTY        0xFFFF
+
+define B_VALID             1
+#define B_TAG               12
+#define B_LAST_CL           16
+#define B_CONST_STRIDE      7      /* |stride| <= 63 after the guard        */
+#define B_CONST_CONF        3
+#define B_LRU               6
+#define B_PAT_VICTIM        3
+#define B_PAT_STRIDE        4      /* only -8..7 is ever stored             */
+#define B_PAT_CONF          2
+#define B_SNAPSHOT          32
+#define B_DEGREE            3
+#define B_FILTER_HEAD       5
+
+/* ---------------- Helpers ---------------- */
+
+/* A stride survives in the signature as 4 bits, so anything outside [-8,7]
+   is indistinguishable from something else and must not be learned. */
+static inline bool sig_representable(int stride)
+{
+    return (stride >= -8) && (stride <= 7);
+}
+
+static inline uint16_t fold_signature(uint16_t sig, int stride)
+{
+    uint16_t encoded = (uint16_t)(stride & 0xF);
+    return (uint16_t)(((sig << 4) | encode
+}
+
+struct pattern_entry {
+    uint16_t signature;   /* last SIG_STRIDES strides, 4 bits each */
+    int8_t   next_stride; /* stride that followed this signature   */
+    uint8_t  conf;
+    bool     valid;
+};
+
+struct ip_tracker {
+    bool     valid;
+    uint16_t tag;         /* 12-bit partial IP tag              */
+    uint16_t last_cl;     /* low 16 bits of last cache-line no. */
+
+    int8_t   const_stride;
+    uint8_t  const_conf;
+
+    uint16_t signature;
+    uint8_t  lru;
+
+    pattern_entry pattern[PATTERN_TABLE_SIZE];
+    uint8_t  pattern_victim;
+};
+
+static ip_tracker ip_table[NUM_CPUS][IP_TABLE_SIZE];
+
+static uint32_t pf_degree[NUM_CPUS];
+static uint32_t last_useful[NUM_CPUS];
+static uint32_t last_useless[NUM_CPUS];
+
+static uint16_t pf_filter[NUM_CPUS][FILTER_SIZE];
+static uint8_t  pf_filter_head[NUM_CPUS];
+
+static inline uint16_t ip_tag_of(uint64_t ip)
+{
+    return (uint16_t)((ip >> 2) & 0xFFF);
+}
+
+static inline uint16_t cl_of(uint64_t addr)
+{
+    return (uint16_t)((addr >> LOG2_BLOCK_SIZE) & 0xFFFF);
+}
+
+/* Signed difference of two wrapped 16-bit line addresses. */
+static inline int cl_delta(uint16_t now, uint16_t old)
+{
+    return (int)(int16_t)(uint16_t)(now - old);
+}
+
+static pattern_entry *lookup_pattern(ip_tracker &t, uint16_t sig)
+{
+    for (int i = 0; i < PATTERN_TABLE_SIZE; i++) {
+        if (t.pattern[i].valid && t.patter
+            return &t.pattern[i];
+    }
+    return NULL;
+}
+
+static pattern_entry *insert_pattern(ip_tracker &t, uint16_t sig, int8_t stride)
+{
+    pattern_entry *e = NULL;
+
+    for (int i = 0; i < PATTERN_TABLE_SIZE; i++) {
+        if (!t.pattern[i].valid) { e = &t.pattern[i]; break; }
+    }
+    if (e == NULL) {
+        e = &t.pattern[t.pattern_victim];
+        t.pattern_victim = (t.pattern_victim + 1) % PATTERN_TABLE_SIZE;
+    }
+
+    e->valid = true;
+    e->signature = sig;
+    e->next_stride = stride;
+    e->conf = 1;
+    return e;
+}
+
+static void reset_tracker(ip_tracker &t, uint64_t ip, uint64_t addr)
+{
+    uint8_t old_lru = t.lru;   /* the calllot */
+   t.valid = true;
+    t.tag = ip_tag_of(ip);
+    t.last_cl = cl_of(addr);
+    t.const_stride = 0;
+    t.const_conf = 0;
+    t.signature = 0;
+    t.lru = old_lru;
+    t.pattern_victim = 0;
+
+    for (int i = 0; i < PATTERN_TABLE_SIZE; i++) {
+        t.pattern[i].valid = false;
+        t.pattern[i].signature = 0;
+        t.pattern[i].next_stride = 0;
+        t.pattern[i].conf = 0;
+    }
+}
+
+static void promote(uint32_t cpu, int index)
+{
+    uint8_t old = ip_table[cpu][index].lru;
+    for (int i = 0; i < IP_TABLE_SIZE; i++) {
+        if (i != index && ip_table[cpu][i].lru < old)
+            ip_table[cpu][i].lru++;
+    }
+    ip_table[cpu][index].lru = 0;
+}
+
+/* ---------------- Recent-prefetch filter ---------------- */
+static bool filter_hit(uint32_t cpu, uint16_t cl)
+{
+    for (int i = 0; i < FILTER_SIZE; i++)
+        if (pf_filter[cpu][i] == cl) return true;
+    return false;
+}
+* Issue one prefetch unless the same line was requested recently. Recorded
+   only if the cache accepted it; prefetch_line returns nonzero on success. */
+static void issue_pf(CACHE *c, uint64_t ip, uint64_t addr, uint64_t pf_addr)
+{
+    uint32_t cpu = c->cpu;
+    uint16_t pcl = cl_of(pf_addr);
+
+    if (filter_hit(cpu, pcl))
+        return;
+
+    int ok = c->prefetch_line(
+        ip, addr, pf_addr,
+        (c->MSHR.occupancy < (c->MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2,
+        0);
+
+    if (ok) {
+        pf_filter[cpu][pf_filter_head[cpu]] = pcl;
+        pf_filter_head[cpu] = (pf_filter_head[cpu] + 1) % FILTER_SIZE;
+    }
+}
+
+/* ---------------- Prefetch generation ---------------- */
+
+/* Constant stride: multiplying the stride is exactly right here. */
+static void issue_uniform(CACHE *c, uint64_t ip, uint64_t addr,
+                          int stride, uint
+{
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page    = addr >> LOG2_PAGE_SIZE;
+
+    for (uint32_t i = 1; i <= PREFETCH_SKIP + degree; i++) {
+        int64_t target_cl = (int64_t)cl_addr + (int64_t)stride * i;
+        if (target_cl < 0)
+            return;
+        if (i <= PREFETCH_SKIP)
+            continue;
+
+        uint64_t pf_addr = ((uint64_t)target_cl) << LOG2_BLOCK_SIZE;
+        if ((pf_addr >> LOG2_PAGE_SIZE) !=e page */
+           return;
+
+        issue_pf(c, ip, addr, pf_addr);
+    }
+}
+
+/* Non-uniform: walk the predicted chain one stride at a time. Multiplying a
+   single stride (as plain IP-stride does) is wrong for a repeating sequence,
+   so each hop folds its own prediction into a scratch signature and looks up
+   the next one. */
+static bool issue_pattern(CACHE *c, ip_tracker &t, uint64_t ip,
+                          uint64_t addr, uint32_t degree)
+{
+    uint16_t sig = t.signature;
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page    = addr >> LOG2_PAGE_SIZE;
+    bool issued_any = false;
+
+    for (uint32_t i = 1; i <= PREFETCH_SKIP + degree; i++) {
+        pattern_entry *e = lookup_pattern(t, sig);
+        if (e == NULL || e->conf < PATTERN_CONF_TH || e->next_stride == 0)
+            break;
+
+        int stride = e->next_stride;
+        int64_t target_cl = (int64_t)cl_addr + (int64_t)stride;
+        if (target_cl < 0)
+            break;
+
+        cl_addr = (uint64_t)target_cl;
+        sig = fold_signature(sig, stride);
+
+        if (i <= PREFETCH_SKIP)
+            continue;
+
+        uint64_t pf_addr = cl_addr << LOG2_BLOCK_SIZE;
+        if ((pf_addr >> LOG2_PAGE_SIZE) != page)
+            break;
+
+        issue_pf(c, ip, addr, pf_addr);
+        issued_any = true;
+    }
+    return issued_any;
+}
+
+/* ---------------- Accuracy throttle ----
+static void update_degree(CACHE *c)
+{
+    uint32_t cpu = c->cpu;
+
+    uint32_t cur_useful  = (uint32_t)c->pf
+    uint32_t cur_useless = (uint32_t)c->pf
+
+    uint32_t useful  = cur_useful  - last_useful[cpu];
+    uint32_t useless = cur_useless - last_
+    uint32_t feedback = useful + useless;
+
+    if (feedback < THROTTLE_WINDOW)
+        return;
+
+    uint32_t acc = (useful * 100) / feedback;
+    uint32_t d = pf_degree[cpu];
+
+    if (d < MAX_DEGREE && acc >= ACC_STEP * d + HYST)
+        pf_degree[cpu] = d + 1;
+    else if (d > MIN_DEGREE && acc + HYST < ACC_STEP * (d - 1))
+        pf_degree[cpu] = d - 1;
+
+    last_useful[cpu]  = cur_useful;
+    last_useless[cpu] = cur_useless;
+}
+
+/* ---------------- ChampSim hooks ---------------- */
+void CACHE::l1d_prefetcher_initialize()
+   std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i = 0; i < IP_TABLE_SIZE; i++) {
+        ip_table[cpu][i].valid = false;
+        ip_table[cpu][i].lru = i;
+        ip_table[cpu][i].tag = 0;
+        ip_table[cpu][i].last_cl = 0;
+        ip_table[cpu][i].const_stride = 0;
+        ip_table[cpu][i].const_conf = 0;
+        ip_table[cpu][i].signature = 0;
+        ip_table[cpu][i].pattern_victim = 0;
+
+        for (int j = 0; j < PATTERN_TABLE_SIZE; j++) {
+            ip_table[cpu][i].pattern[j].valid = false;
+            ip_table[cpu][i].pattern[j].signature = 0;
+            ip_table[cpu][i].pattern[j].next_stride = 0;
+            ip_table[cpu][i].pattern[j].conf = 0;
+        }
+    }
+
+    for (int i = 0; i < FILTER_SIZE; i++)
+        pf_filter[cpu][i] = FILTER_EMPTY;
+    pf_filter_head[cpu] = 0;
+
+    pf_degree[cpu] = MAX_DEGREE;
+    last_useful[cpu] = 0;
+    last_useless[cpu] = 0;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                   uint8_t cache_hit, uint8_t type,
+                                   uint8_t critical_ip_flag)
 {
-   
+    uint32_t cpu_id = cpu;
+
+    update_degree(this);   /* before any early return, so it always runs */
+
+    uint16_t tag = ip_tag_of(ip);
+    uint16_t cl  = cl_of(addr);
+   /* 1) find the tracker: tag hit, else free entry, else LRU victim */
+    int index = -1;
+    for (int i = 0; i < IP_TABLE_SIZE; i++) {
+        if (ip_table[cpu_id][i].valid && ip_table[cpu_id][i].tag == tag) {
+            index = i; break;
+        }
+    }
+    if (index == -1) {
+        for (int i = 0; i < IP_TABLE_SIZE; i++) {
+            if (!ip_table[cpu_id][i].valid) { index = i; break; }
+        }
+    }
+    if (index == -1) {
+        for (int i = 0; i < IP_TABLE_SIZE; i++) {
+            if (ip_table[cpu_id][i].lru == IP_TABLE_SIZE - 1) {
+                index = i; break;
+            }
+        }
+    }
+    if (index == -1)
+        return;
+
+    /* 2) new IP: allocate and wait for the next access */
+    if (!ip_table[cpu_id][index].valid ||
+        ip_table[cpu_id][index].tag != tag) {
+        promote(cpu_id, index);
+        reset_tracker(ip_table[cpu_id][index], ip, addr);
+        return;
+    }
+
+    ip_tracker &t = ip_table[cpu_id][index];
+    promote(cpu_id, index);
+
+    /* 3) stride in cache lines */
+    int stride = cl_delta(cl, t.last_cl);
+    t.last_cl = cl;
+
+    if (stride == 0)
+        return;
+
+    /* A stride of 64+ lines cannot stay iefetch off
+       it could ever issue, and it would be truncated by the int8_t store.
+       Treat it as a pattern break. */
+    if (stride < -63 || stride > 63) {
+        t.const_conf = 0;
+        t.signature = 0;
+        return;
+    }
+
+    /* 4) uniform detector. Resetting on mmenting)
+          is what stops the run of three e,+2,+2,+3)
+          from ever reaching UNIFORM_CONF_MAX and hijacking a non-uniform IP. */
+    if (stride == t.const_stride) {
+        if (t.const_conf < UNIFORM_CONF_MA
+            t.const_conf++;
+    } else {
+        t.const_stride = (int8_t)stride;
+        t.const_conf = 1;
+    }
+
+    bool uniform = (t.const_conf >= UNIFORM_CONF_MAX);
+
+    if (uniform)
+        issue_uniform(this, ip, addr, t.coid]);
+
+    /* 5) non-uniform. Train the entry keyed on the signature BEFORE this
+          stride, then fold the stride in,cts what
+          comes next. Used only when this IP is not uniform. */
+    if (sig_representable(stride)) {
+        pattern_entry *e = lookup_pattern(t, t.signature);
+
+        if (e == NULL) {
+            insert_pattern(t, t.signature, (int8_t)stride);
+        } else if (e->next_stride == strid
+           if (e->conf < CONF_MAX) e->conf++;
+        } else if (e->conf > 0) {
+            e->conf--;
+        } else {
+            e->next_stride = (int8_t)stride;   /* relearn once the old one died */
+            e->conf = 1;
+        }
+
+        t.signature = fold_signature(t.signature, stride);
+
+        if (!uniform)
+            issue_pattern(this, t, ip, addr, pf_degree[cpu_id]);
+    } else {
+        t.signature = 0;
+    }
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
+                                      uint32_t set, uint32_t way,
+                                      uint8_t prefetch,
+                                      uint64_t v_evicted_addr,
+                                      uint64_t evicted_addr,
+                                      uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+    const int pattern_bits =
+        B_VALID + SIG_BITS + B_PAT_STRIDE + B_PAT_CONF;
 
+    const int tracker_bits =
+        B_VALID + B_TAG + B_LAST_CL + B_CONST_STRIDE + B_CONST_CONF +
+        SIG_BITS + B_LRU + B_PAT_VICTIM +
+        PATTERN_TABLE_SIZE * pattern_bits;
+
+    const int global_bits =
+        B_DEGREE + 2 * B_SNAPSHOT +
+        FILTER_SIZE * 16 + B_FILTER_HEAD;
+
+    const int total_bits = IP_TABLE_SIZE * tracker_bits + global_bits;
+
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "        SPP Final Statistics                    " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "Final degree: " << pf_degree[cpu] << std::endl;
+    std::cout << "Prefetch skip: " << PREFETCH_SKIP << std::endl;
+    std::cout << "IP trackers: " << IP_TABLE_SIZE << std::endl;
+    std::cout << "Pattern entries/IP: " << PATTERN_TABLE_SIZE << std::endl;
+    std::cout << "Signature history length:endl;
+    std::cout << "Pattern entry bits: " << pattern_bits << std::endl;
+    std::cout << "Tracker bits: " << tracker_bits << std::endl;
+    std::cout << "Global bits: " << global_bits << std::endl;
+    std::cout << "Total storage bits: " << total_bits << std::endl;
+    std::cout << "Total storage bytes: " <d::endl;
 }
