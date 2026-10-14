@@ -1,0 +1,87 @@
+#include "cache.h"
+
+// Task 2a: Instruction-conscious RRIP (I-RRIP) for L2C
+//
+//  Insertion : instruction fill -> RRPV 0 (near re-reference)
+//              data/other fill  -> RRPV maxRRPV-1 (same as SRRIP)
+//  Promotion : instruction hit  -> RRPV 0
+//              data hit         -> RRPV-1 (gradual; SRRIP would jump to 0)
+//  Eviction  : among lines at maxRRPV, evict a DATA line first;
+//              evict an instruction line only if every max-RRPV line is one.
+
+#define maxRRPV 3
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 bit/line: line holds instructions
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1)
+    {
+        int instr_candidate = -1;
+
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!l2_is_instr[set][i])
+                    return i;                  // data line at max: best victim
+                if (instr_candidate < 0)
+                    instr_candidate = i;       // remember an instruction line
+            }
+        }
+
+        // only instruction lines at max RRPV: evict one rather than age forever
+        if (instr_candidate >= 0)
+            return instr_candidate;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // Writebacks are not demand reuse: insert at distant, never promote.
+    if (type == WRITEBACK) {
+        if (!hit) {
+            l2_rrpv[set][way] = maxRRPV;
+            l2_is_instr[set][way] = 0;
+        }
+        return;
+    }
+
+    if (hit) {
+        if (isInstruction) {
+            l2_is_instr[set][way] = 1;
+            l2_rrpv[set][way] = 0;
+        } else if (l2_is_instr[set][way]) {
+            l2_rrpv[set][way] = 0;             // instruction line touched by data: keep hot
+        } else {
+            if (l2_rrpv[set][way] > 0)
+                l2_rrpv[set][way]--;           // gradual promotion for data
+        }
+    } else {                                    // fill (insertion)
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+        l2_rrpv[set][way] = isInstruction ? 0 : (maxRRPV - 1);
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+}

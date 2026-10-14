@@ -1,0 +1,185 @@
+#include "cache.h"
+
+// Task 2b: Dynamic I-RRIP via set dueling
+//
+//  * NUM_LEADERS leader sets ALWAYS run plain SRRIP and are used only to
+//    measure how much of the L2 traffic is instruction traffic.
+//  * All other (follower) sets run I-RRIP when
+//        (instr_acc + instr_miss) / (total_acc + total_miss) > THRESH
+//    and plain SRRIP otherwise.
+//  * Counters are halved every EPOCH leader events so the decision tracks
+//    program phases instead of the whole-run average.
+//
+// Sensitivity study: change THRESH_PCT (5, 15, 25, 35, 50) and rebuild, or
+// pass -DTHRESH_PCT=<n> if your build script allows extra flags.
+
+#define maxRRPV 3
+
+#ifndef THRESH_PCT
+#define THRESH_PCT 25          // threshold in percent (0.25)
+#endif
+#ifndef NUM_LEADERS
+#define NUM_LEADERS 16         // leader sets (out of L2C_SET)
+#endif
+#ifndef EPOCH
+#define EPOCH 16384            // leader events between decisions
+#endif
+#ifndef MIN_SAMPLES
+#define MIN_SAMPLES 1024       // ignore the score until enough samples exist
+#endif
+
+#define LEADER_STRIDE (L2C_SET / NUM_LEADERS)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];
+
+// leader-set sampling counters
+static uint64_t i_acc, i_miss, t_acc, t_miss;
+static uint64_t epoch_cnt;
+static bool     use_irrip;                 // mode used by follower sets
+
+// stats for the report
+static uint64_t mode_switches, irrip_epochs, rrip_epochs;
+static uint64_t follower_fills_irrip, follower_fills_rrip;
+
+static inline bool is_leader(uint32_t set)
+{
+    return (set % LEADER_STRIDE) == 0;
+}
+
+static void decide_mode()
+{
+    uint64_t denom = t_acc + t_miss;
+    if (denom < MIN_SAMPLES)
+        return;
+
+    // (i_acc + i_miss) / (t_acc + t_miss) > THRESH_PCT/100, in integers
+    bool new_mode = ((i_acc + i_miss) * 100) > ((uint64_t)THRESH_PCT * denom);
+
+    if (new_mode != use_irrip)
+        mode_switches++;
+    use_irrip = new_mode;
+
+    if (use_irrip) irrip_epochs++;
+    else           rrip_epochs++;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (leaders=" << NUM_LEADERS
+         << ", stride=" << LEADER_STRIDE << ", threshold=" << THRESH_PCT << "%)" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+    }
+    i_acc = i_miss = t_acc = t_miss = 0;
+    epoch_cnt = 0;
+    use_irrip = false;
+    mode_switches = irrip_epochs = rrip_epochs = 0;
+    follower_fills_irrip = follower_fills_rrip = 0;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool irrip_here = (!is_leader(set)) && use_irrip;
+
+    while (1)
+    {
+        int instr_candidate = -1;
+
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!irrip_here)
+                    return i;                       // plain RRIP: first max line
+                if (!l2_is_instr[set][i])
+                    return i;                       // I-RRIP: prefer data victim
+                if (instr_candidate < 0)
+                    instr_candidate = i;
+            }
+        }
+
+        if (instr_candidate >= 0)
+            return instr_candidate;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // Writebacks: not demand traffic, so excluded from sampling and promotion.
+    if (type == WRITEBACK) {
+        if (!hit) {
+            l2_rrpv[set][way] = maxRRPV;
+            l2_is_instr[set][way] = 0;
+        }
+        return;
+    }
+
+    bool leader = is_leader(set);
+
+    // ---- sample leader sets only (they always run SRRIP) ----
+    if (leader) {
+        t_acc++;
+        if (isInstruction) i_acc++;
+        if (!hit) {
+            t_miss++;
+            if (isInstruction) i_miss++;
+        }
+
+        if (++epoch_cnt >= EPOCH) {
+            decide_mode();
+            i_acc >>= 1; i_miss >>= 1; t_acc >>= 1; t_miss >>= 1;   // decay
+            epoch_cnt = 0;
+        }
+    }
+
+    bool irrip_here = (!leader) && use_irrip;
+
+    if (hit) {
+        if (!irrip_here) {
+            l2_rrpv[set][way] = 0;                  // SRRIP promotion
+        } else if (isInstruction) {
+            l2_is_instr[set][way] = 1;
+            l2_rrpv[set][way] = 0;
+        } else if (l2_is_instr[set][way]) {
+            l2_rrpv[set][way] = 0;
+        } else if (l2_rrpv[set][way] > 0) {
+            l2_rrpv[set][way]--;                    // gradual for data
+        }
+        // keep the instruction tag accurate in every mode
+        if (isInstruction)
+            l2_is_instr[set][way] = 1;
+    } else {                                        // fill
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+        if (irrip_here && isInstruction)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;
+
+        if (!leader) {
+            if (irrip_here) follower_fills_irrip++;
+            else            follower_fills_rrip++;
+        }
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "DYN_IRRIP threshold=" << THRESH_PCT << "% leaders=" << NUM_LEADERS
+         << " mode_switches=" << mode_switches
+         << " irrip_epochs=" << irrip_epochs
+         << " rrip_epochs=" << rrip_epochs
+         << " follower_fills_irrip=" << follower_fills_irrip
+         << " follower_fills_rrip=" << follower_fills_rrip << endl;
+}
