@@ -227,4 +227,4 @@ void CACHE::l2c_replacement_final_stats()
          << " follower_fills_prefetch_mode=" << follower_fills_prefetch_mode
          << " follower_fills_normal_mode=" << follower_fills_normal_mode
          << endl;
-} optimise it further to achieve even greade speedup
+} 
