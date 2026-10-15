@@ -2,18 +2,18 @@
 
 #define maxRRPV 3
 
-// ---------- tunables (override with -D or edit the defaults) ----------
+// ---------- dynamic I-RRIP tunables ----------
 #ifndef NUM_LEADERS
-#define NUM_LEADERS 32               // leader sets that ALWAYS run plain RRIP
+#define NUM_LEADERS 32
 #endif
 #ifndef THRESH_PCT
-#define THRESH_PCT 15                // instruction-share threshold (percent)
+#define THRESH_PCT 25
 #endif
 #ifndef EPOCH
-#define EPOCH 1024                   // leader events between mode decisions
+#define EPOCH 1024
 #endif
 #ifndef INSTR_MAX_WAYS
-#define INSTR_MAX_WAYS 3             // protect instructions only while they hold <= this many ways
+#define INSTR_MAX_WAYS 3
 #endif
 #ifndef INSTR_INSERT_RRPV
 #define INSTR_INSERT_RRPV 1
@@ -22,31 +22,56 @@
 #define DATA_INSERT_RRPV (maxRRPV - 1)
 #endif
 #ifndef PRINT_EVERY
-#define PRINT_EVERY 32               // print a status line every N epochs
+#define PRINT_EVERY 32
 #endif
 
+// ---------- prefetch-awareness tunables ----------
+#define PSEL_MAX 1023
+#define PSEL_MID 512
+#ifndef PSEL_INIT
+#define PSEL_INIT (PSEL_MID + 256)   // start by distrusting prefetches (L2 accuracy is low)
+#endif
+#ifndef PF_TRUST_INSERT_RRPV
+#define PF_TRUST_INSERT_RRPV (maxRRPV - 1)   // trusted prefetch: inserted like demand data
+#endif
+// distrusted prefetch is inserted at maxRRPV (first victim)
+
 #define LEADER_STRIDE (L2C_SET / NUM_LEADERS)
+#define PF_TRUST_RES    8    // set % 32 == 8  -> always trust prefetches
+#define PF_DISTRUST_RES 24   // set % 32 == 24 -> always distrust prefetches
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
+// dyn I-RRIP state
 static uint64_t instr_acc, instr_miss, total_acc, total_miss, leader_events;
 static bool     irrip_mode;
 static uint64_t epochs, epochs_irrip, mode_switches, last_ratio_pct;
-static uint64_t fills_irrip, fills_rrip, capped_evictions;
+static uint64_t cap_fallbacks;
+
+// prefetch-awareness state
+static int32_t  psel;
+static uint64_t pf_fills, pf_fills_trust, pf_fills_distrust, useful_pf_hits, pf_victims;
 
 static inline bool is_leader(uint32_t set) { return (set % LEADER_STRIDE) == 0; }
 static inline bool use_irrip(uint32_t set) { return is_leader(set) ? false : irrip_mode; }
 
+static inline bool trust_pf(uint32_t set)
+{
+    uint32_t r = set % 32;
+    if (r == PF_TRUST_RES)    return true;
+    if (r == PF_DISTRUST_RES) return false;
+    return psel <= PSEL_MID;
+}
+
 static void print_stats(const char *tag)
 {
-    cout << "DYN_IRRIP[" << tag << "] epochs=" << epochs
-         << " epochs_irrip=" << epochs_irrip
-         << " mode_switches=" << mode_switches
-         << " last_instr_ratio_pct=" << last_ratio_pct
-         << " mode=" << (irrip_mode ? "IRRIP" : "RRIP")
-         << " follower_fills_irrip=" << fills_irrip
-         << " follower_fills_rrip=" << fills_rrip
-         << " cap_fallbacks=" << capped_evictions << endl;
+    cout << "DYN_IRRIP_PF[" << tag << "] epochs=" << epochs
+         << " epochs_irrip=" << epochs_irrip << " switches=" << mode_switches
+         << " ratio_pct=" << last_ratio_pct << " mode=" << (irrip_mode ? "IRRIP" : "RRIP")
+         << " psel=" << psel << " pf_fills=" << pf_fills
+         << " trust=" << pf_fills_trust << " distrust=" << pf_fills_distrust
+         << " useful_pf_hits=" << useful_pf_hits << " pf_victims=" << pf_victims
+         << " cap_fallbacks=" << cap_fallbacks << endl;
 }
 
 static void decide_mode()
@@ -71,7 +96,7 @@ static void decide_mode()
 
 void CACHE::l2c_initialize_replacement()
 {
-    cout << "Initialize dynamic I-RRIP (capped) for L2C: leaders=" << NUM_LEADERS
+    cout << "Initialize prefetch-aware dynamic I-RRIP: leaders=" << NUM_LEADERS
          << " threshold=" << THRESH_PCT << "% epoch=" << EPOCH
          << " instr_max_ways=" << INSTR_MAX_WAYS << endl;
 
@@ -80,9 +105,10 @@ void CACHE::l2c_initialize_replacement()
             l2_rrpv[i][j] = maxRRPV;
 
     instr_acc = instr_miss = total_acc = total_miss = leader_events = 0;
-    epochs = epochs_irrip = mode_switches = last_ratio_pct = 0;
-    fills_irrip = fills_rrip = capped_evictions = 0;
+    epochs = epochs_irrip = mode_switches = last_ratio_pct = cap_fallbacks = 0;
     irrip_mode = false;
+    psel = PSEL_INIT;
+    pf_fills = pf_fills_trust = pf_fills_distrust = useful_pf_hits = pf_victims = 0;
 }
 
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
@@ -93,25 +119,31 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
         if (!current_set[i].valid)
             return i;
 
-    // Protect instruction lines only in I-RRIP mode AND while they hold few ways.
-    // Above the cap, behave like plain RRIP so stale instruction lines can leave.
     int n_instr = 0;
     for (int i = 0; i < L2C_WAY; i++)
         if (current_set[i].instruction) n_instr++;
 
     bool want_prot = use_irrip(set);
     bool prot = want_prot && (n_instr <= INSTR_MAX_WAYS);
-    if (want_prot && !prot) capped_evictions++;
+    if (want_prot && !prot) cap_fallbacks++;
+
+    bool distrust = !trust_pf(set);
 
     while (1) {
-        int first = -1, data_victim = -1, data_exists = 0;
+        int first = -1, data_victim = -1, pf_victim = -1, data_exists = 0;
 
         for (int i = 0; i < L2C_WAY; i++) {
             if (!current_set[i].instruction) data_exists = 1;
             if (l2_rrpv[set][i] != maxRRPV) continue;
             if (first < 0) first = i;
             if (!current_set[i].instruction && data_victim < 0) data_victim = i;
+            // never-used data prefetch (not a translation line)
+            if (current_set[i].prefetch && !current_set[i].translation &&
+                !current_set[i].instruction && pf_victim < 0) pf_victim = i;
         }
+
+        // when distrusting SPP, dead prefetches leave first
+        if (distrust && pf_victim >= 0) { pf_victims++; return pf_victim; }
 
         if (!prot) {
             if (first >= 0) return first;
@@ -142,19 +174,22 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         return;
     }
 
+    bool is_prefetch = (type == PREFETCH);
+
+    // instruction flag: stored block flag on hit, MSHR packet on fill
     bool is_instr;
     if (hit) {
         is_instr = block[set][way].instruction;
     } else {
-        is_instr = false;     // fill: the packet is still in the MSHR at this point
+        is_instr = false;
         if (MSHR.next_fill_index < MSHR.SIZE) {
             const PACKET &p = MSHR.entry[MSHR.next_fill_index];
             is_instr = p.instruction && (type == LOAD || type == PREFETCH);
         }
     }
 
-    // set dueling statistics come from leader sets (plain RRIP) only
-    if (is_leader(set)) {
+    // instruction-share statistics come from RRIP leader sets, DEMAND accesses only
+    if (is_leader(set) && !is_prefetch) {
         total_acc++;
         if (is_instr) instr_acc++;
         if (!hit) {
@@ -165,13 +200,29 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             decide_mode();
     }
 
+    /* ---------------- HIT ---------------- */
     if (hit) {
-        l2_rrpv[set][way] = 0;                       // standard RRIP promotion
+        if (is_prefetch)
+            return;                              // prefetch re-touch: no promotion
+        if (block[set][way].prefetch && !block[set][way].translation)
+            useful_pf_hits++;                    // first demand use of a prefetched line
+        l2_rrpv[set][way] = 0;                   // demand hit: promote
         return;
     }
 
-    if (!is_leader(set)) {
-        if (prot) fills_irrip++; else fills_rrip++;
+    /* ---------------- FILL ---------------- */
+    if (is_prefetch) {
+        pf_fills++;
+        if (trust_pf(set)) { l2_rrpv[set][way] = PF_TRUST_INSERT_RRPV; pf_fills_trust++; }
+        else               { l2_rrpv[set][way] = maxRRPV;              pf_fills_distrust++; }
+        return;
+    }
+
+    // set dueling for prefetch trust: count DEMAND load/RFO misses in the two leader groups
+    if (type == LOAD || type == RFO) {
+        uint32_t r = set % 32;
+        if (r == PF_TRUST_RES    && psel < PSEL_MAX) psel++;   // trust leader missed
+        if (r == PF_DISTRUST_RES && psel > 0)        psel--;   // distrust leader missed
     }
 
     if (prot && is_instr)
