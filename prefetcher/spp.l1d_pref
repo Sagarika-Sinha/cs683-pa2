@@ -2,359 +2,1951 @@
 #include <cstdint>
 #include <algorithm>
 
-/* ================= Switches: change ONE per run ================= */
-#define PAGE_PRED         1   /* page-local delta predictor (0 = off)   */
-#define PAGE_DEGREE       2   /* lines prefetched by the page predictor */
-#define PAGE_ENTRIES      64  /* tracked p    */
-#define PAGE_CONF_TH      2   /* confidenc    */
+/* ================= Switches (override with -D for ablations) ================= */
+#ifndef PAGE_PRED
+#define PAGE_PRED         1
+#endif
+#ifndef PAGE_DEGREE
+#define PAGE_DEGREE       2
+#endif
+#ifndef PAGE_ENTRIES
+#define PAGE_ENTRIES      64
+#endif
+#ifndef PAGE_CONF_TH
+#define PAGE_CONF_TH      2
+#endif
+#ifndef FIX_FILTER_INSERT
 #define FIX_FILTER_INSERT 1
-#define FIX_THROTTLE      0
+#endif
+#ifndef FIX_PATTERN
 #define FIX_PATTERN       0
+#endif
+#ifndef UNIFORM_TH
 #define UNIFORM_TH        2
+#endif
+
+#ifndef SPP_PROFILE
+#define SPP_PROFILE       1
+#endif
+#if SPP_PROFILE
+#define PROF_SRC(x)   (prof_src = (x))
+#define PROF_CLASS(x) (prof_class = (x))
+#else
+#define PROF_SRC(x)   ((void)0)
+#define PROF_CLASS(x) ((void)0)
+#endif
+
+/* ================= Footprint predictor ================= */
+#ifndef FOOTPRINT
+#define FOOTPRINT         1
+#endif
+
+/* CHANGED: 4096 -> 8192 for next experiment */
+#ifndef FP_ENTRIES
+#define FP_ENTRIES        8192
+#endif
+
+#ifndef FP_CONF_MIN
+#define FP_CONF_MIN       1
+#endif
+#ifndef FP_BURST
+#define FP_BURST          4
+#endif
+#ifndef FP_PER_ACCESS
+#define FP_PER_ACCESS     2
+#endif
+#ifndef FP_MIN_LINES
+#define FP_MIN_LINES      3
+#endif
+
+/* ================= Experiments ================= */
+#ifndef IP_INSERT_LRU
+#define IP_INSERT_LRU     0
+#endif
+#ifndef PAT_DEPTH
+#define PAT_DEPTH         2
+#endif
+#ifndef PAT_CONF_MIN
+#define PAT_CONF_MIN      1
+#endif
+
+#ifndef TYPE_FILTER
+#define TYPE_FILTER       0
+#endif
+#ifndef FRONTIER
+#define FRONTIER          0
+#endif
+#ifndef AHEAD_MULT
+#define AHEAD_MULT        2
+#endif
+#ifndef THROTTLE_MODE
+#define THROTTLE_MODE     2
+#endif
+#ifndef THR_WINDOW
+#define THR_WINDOW        128
+#endif
+#ifndef THR_DEC_ACC
+#define THR_DEC_ACC       20
+#endif
+#ifndef THR_INC_ACC
+#define THR_INC_ACC       45
+#endif
 
 /* ================= Configuration ================= */
-#define IP_SETS 64
-#define IP_WAYS 4
+#ifndef IP_SETS
+#define IP_SETS 1024
+#endif
+#ifndef IP_WAYS
+#define IP_WAYS 8
+#endif
+
+#ifndef PATTERN_TABLE_SIZE
+#define PATTERN_TABLE_SIZE 8
+#endif
+
+#define SIG_BITS 16
+#define SIG_STRIDES 4
+#define UNIFORM_CONF_MAX 4
+#define PATTERN_CONF_MAX 3
+#define MIN_DEGREE 1
 #define MAX_DEGREE 4
-#define START_DEGREE 4
-#define THROTTLE_WINDOW 256
+#define START_DEGREE 2
+#define FILTER_SIZE 32
+#define LEGACY_WINDOW 256
 #define ACC_DEGREE_1 25
 #define ACC_DEGREE_2 40
 #define ACC_DEGREE_3 55
 #define ACC_DEGREE_4 70
 #define HYSTERESIS 5
-#define FILTER_SIZE 32
 #define BLOCK_SIZE 64
 
 struct PATTERN_ENTRY {
     uint16_t signature;
     int8_t   next_stride;
+    uint8_t  confidence;
+    uint8_t  valid;
+};
+
+struct IP_TRACKER {
+    uint8_t  valid;
+    uint64_t ip;
+    uint64_t last_cl;
+    int8_t   last_stride;
+    uint8_t  uniform_confidence;
+    uint8_t  pattern_confidence;
+    uint16_t signature;
+    uint8_t  lru;
+
+    uint64_t frontier;
+    uint8_t  fr_valid;
+    int8_t   fr_stride;
+
+    uint64_t pf_line;
+    uint16_t pf_sig;
+    uint8_t  pf_steps;
+    uint8_t  pf_valid;
+
     PATTERN_ENTRY pattern[PATTERN_TABLE_SIZE];
 };
 
 struct PAGE_ENTRY {
     uint8_t  valid;
     uint64_t page;
-    int8_t   last_off;     /* 0..63 */
+    int8_t   last_off;
     int8_t   last_delta;
     uint8_t  conf;
-    uint32_t stamp;        /* LRU timestamp */
+    uint32_t stamp;
+    uint64_t bitmap;
+    uint64_t pending;
+    uint16_t key;
 };
 
+struct FP_ENTRY {
+    uint8_t valid;
+    uint8_t tag;
+    uint8_t conf;
+    uint64_t fp;
+};
+
+static FP_ENTRY fp_tab[FP_ENTRIES];
+static bool     g_page_new = false;
+
+static uint64_t fp_trained = 0;
+static uint64_t fp_triggers = 0;
+static uint64_t fp_trig_hits = 0;
+static uint64_t fp_issued = 0;
+
 static IP_TRACKER ip_table[IP_SETS][IP_WAYS];
-static PAGE_ENTRY page_table[PAGE_ENTRIES]
+static PAGE_ENTRY page_table[PAGE_ENTRIES];
+static uint32_t page_clock = 0;
+
+static uint64_t filter_table[FILTER_SIZE];
+static uint8_t  filter_valid[FILTER_SIZE];
 
 static uint32_t current_degree = START_DEGREE;
 static uint64_t throttle_counter = 0;
+static uint64_t degree_time[MAX_DEGREE + 1];
 
 static uint64_t attempted_prefetches, issued_prefetches;
 static uint64_t uniform_predictions, pattern_predictions, stream_predictions;
 static uint64_t page_predictions, page_issued;
 static uint64_t filtered_duplicates, page_blocked, rejected_predictions;
 static uint64_t degree_used[MAX_DEGREE + 1];
-static uint64_t throttle_evals;
+static uint64_t throttle_evals, throttle_ups, throttle_downs;
 static uint64_t last_pf_useful, last_pf_useless;
 
+#if SPP_PROFILE
+
+static uint8_t  prof_src = 0;
+static uint64_t prof_issued[5], prof_touch_hit[5], prof_touch_miss[5];
+
+struct PROF_ENT {
+    uint8_t valid;
+    uint8_t src;
+    uint64_t line;
+};
+
+static PROF_ENT prof_tab[2048];
+
+static uint64_t miss_class[9];
+static int      prof_class = 0;
+static bool     prof_page_new = false;
+static uint64_t prof_demand_loads = 0;
+static uint64_t prof_demand_miss = 0;
+
+#endif
+
 /* ================= Helpers ================= */
-static inline uint32_t get_ip_set(uint64_t
-static inline bool same_page(uint64_t a, uint64_t b) { return (a >> 12) == (b >> 12); }
+
+static inline uint32_t get_ip_set(uint64_t ip)
+{
+    uint64_t x = ip;
+
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+
+    return (uint32_t)(x & (IP_SETS - 1));
+}
+
+static inline uint8_t encode_stride(int s)
+{
+    int e = s + 128;
+
+    if (e < 0) e = 0;
+    if (e > 255) e = 255;
+
+    return (uint8_t)e;
+}
+
+static inline uint16_t update_signature(uint16_t sig, int stride)
+{
+    return (uint16_t)(((sig << 4) ^
+                       encode_stride(stride)) &
+                      0xFFFF);
+}
+
+static inline bool same_page(uint64_t a, uint64_t b)
+{
+    return (a >> 12) == (b >> 12);
+}
 
 static inline uint64_t filter_hash(uint64_t cl)
 {
     uint64_t x = cl;
-    x ^= x >> 23; x *= 0x2127599bf4325c37ULL; x ^= x >> 47;
+
+    x ^= x >> 23;
+    x *= 0x2127599bf4325c37ULL;
+    x ^= x >> 47;
+
     return x;
 }
+
 static bool filter_contains(uint64_t cl)
 {
-    uint32_t i = (uint32_t)(filter_hash(cl) % FILTER_SIZE);
-    return filter_valid[i] && filter_table[i] == cl;
-}
-static void filter_insert(uint64_t cl)
-{
-    uint32_t i = (uint32_t)(filter_hash(cl) % FILTER_SIZE);
-    filter_table[i] = cl; filter_valid[i] = 1;
+    uint32_t i =
+        (uint32_t)(filter_hash(cl) % FILTER_SIZE);
+
+    return filter_valid[i] &&
+           filter_table[i] == cl;
 }
 
-/* ================= IP tracker table ====
+static void filter_insert(uint64_t cl)
+{
+    uint32_t i =
+        (uint32_t)(filter_hash(cl) % FILTER_SIZE);
+
+    filter_table[i] = cl;
+    filter_valid[i] = 1;
+}
+
+/* ================= IP tracker table ================= */
+
+static void reset_frontier(IP_TRACKER* t)
+{
+    t->fr_valid = 0;
+    t->frontier = 0;
+    t->fr_stride = 0;
+
+    t->pf_valid = 0;
+    t->pf_line = 0;
+    t->pf_sig = 0;
+    t->pf_steps = 0;
+}
+
+static IP_TRACKER* find_tracker(uint64_t ip)
+{
+    uint32_t set = get_ip_set(ip);
+
+    for (uint32_t way = 0;
+         way < IP_WAYS;
+         way++) {
+
+        if (ip_table[set][way].valid &&
+            ip_table[set][way].ip == ip) {
+
+            uint8_t old_lru =
+                ip_table[set][way].lru;
+
+            for (uint32_t w = 0;
+                 w < IP_WAYS;
+                 w++) {
+
+                if (w != way &&
+                    ip_table[set][w].valid &&
+                    ip_table[set][w].lru < old_lru)
+                    ip_table[set][w].lru++;
+            }
+
+            ip_table[set][way].lru = 0;
+
             return &ip_table[set][way];
         }
     }
 
     uint32_t victim = 0;
-    for (uint32_t way = 0; way < IP_WAYS; way++) {
-        if (!ip_table[set][way].valid) { victim = way; break; }
-        if (ip_table[set][way].lru > ip_table[set][victim].lru) victim = way;
+
+    for (uint32_t way = 0;
+         way < IP_WAYS;
+         way++) {
+
+        if (!ip_table[set][way].valid) {
+            victim = way;
+            break;
+        }
+
+        if (ip_table[set][way].lru >
+            ip_table[set][victim].lru)
+            victim = way;
     }
 
-    IP_TRACKER &t = ip_table[set][victim];
-    t.valid = 1; t.ip = ip; t.last_cl = 0; t.last_stride = 0;
-    t.uniform_confidence = 0; t.pattern_confidence = 0;
-    t.signature = 0; t.lru = 0;
-    for (uint32_t p = 0; p < PATTERN_TABLE_SIZE; p++) {
-        t.pattern[p].valid = 0; t.pattern[p].signature = 0;
-        t.pattern[p].next_stride = 0; t.pattern[p].confidence = 0;
+    IP_TRACKER &t =
+        ip_table[set][victim];
+
+#if IP_INSERT_LRU
+    uint8_t keep_lru = t.lru;
+#endif
+
+    t.valid = 1;
+    t.ip = ip;
+    t.last_cl = 0;
+    t.last_stride = 0;
+    t.uniform_confidence = 0;
+    t.pattern_confidence = 0;
+    t.signature = 0;
+
+#if IP_INSERT_LRU
+    t.lru = keep_lru;
+#else
+    t.lru = 0;
+#endif
+
+    reset_frontier(&t);
+
+    for (uint32_t p = 0;
+         p < PATTERN_TABLE_SIZE;
+         p++) {
+
+        t.pattern[p].valid = 0;
+        t.pattern[p].signature = 0;
+        t.pattern[p].next_stride = 0;
+        t.pattern[p].confidence = 0;
     }
+
     return &t;
 }
 
-static PATTERN_ENTRY* find_pattern(IP_TRACKER* t, uint16_t sig)
+static PATTERN_ENTRY* find_pattern(IP_TRACKER* t,
+                                   uint16_t sig)
 {
+    for (uint32_t i = 0;
+         i < PATTERN_TABLE_SIZE;
+         i++) {
+
+        if (t->pattern[i].valid &&
+            t->pattern[i].signature == sig)
+            return &t->pattern[i];
+    }
+
+    return NULL;
+}
+
+static PATTERN_ENTRY* allocate_pattern(IP_TRACKER* t,
+                                       uint16_t sig)
 {
     PATTERN_ENTRY* e = NULL;
-    for (uint32_t i = 0; i < PATTERN_TABLE_SIZE; i++)
-        if (!t->pattern[i].valid) { e = &t->pattern[i]; break; }
+
+    for (uint32_t i = 0;
+         i < PATTERN_TABLE_SIZE;
+         i++) {
+
+        if (!t->pattern[i].valid) {
+            e = &t->pattern[i];
+            break;
+        }
+    }
+
     if (e == NULL) {
+
         uint32_t v = 0;
-        for (uint32_t i = 1; i < PATTERN_TABLE_SIZE; i++)
-            if (t->pattern[i].confidence < t->pattern[v].confidence) v = i;
+
+        for (uint32_t i = 1;
+             i < PATTERN_TABLE_SIZE;
+             i++) {
+
+            if (t->pattern[i].confidence <
+                t->pattern[v].confidence)
+                v = i;
+        }
+
         e = &t->pattern[v];
     }
-    e->valid = 1; e->signature = sig; e->next_stride = 0; e->confidence = 0;
+
+    e->valid = 1;
+    e->signature = sig;
+    e->next_stride = 0;
+    e->confidence = 0;
+
     return e;
 }
 
-static void train_pattern(IP_TRACKER* t, u
+static void train_pattern(IP_TRACKER* t,
+                          uint16_t sig,
+                          int stride)
 {
-    PATTERN_ENTRY* e = find_pattern(t, sig);
-    if (e == NULL) e = allocate_pattern(t,
+    PATTERN_ENTRY* e =
+        find_pattern(t, sig);
 
-    if (e->confidence == 0) { e->next_stride = (int8_t)stride; e->confidence = 1; return; }
+    if (e == NULL)
+        e = allocate_pattern(t, sig);
+
+    if (e->confidence == 0) {
+
+        e->next_stride = (int8_t)stride;
+        e->confidence = 1;
+
+        return;
+    }
+
     if (e->next_stride == stride) {
-        if (e->confidence < PATTERN_CONF_MAX) e->confidence++;
-    } else {
+
+        if (e->confidence < PATTERN_CONF_MAX)
+            e->confidence++;
+    }
+    else {
+
+        if (e->confidence > 0)
+            e->confidence--;
+
+        if (e->confidence == 0) {
+
+            e->next_stride = (int8_t)stride;
+            e->confidence = 1;
+        }
+    }
+}
+
 static uint32_t get_prediction_degree(uint8_t confidence)
 {
     uint32_t d = 1;
+
     if (confidence >= 2) d = 2;
     if (confidence >= 3) d = 3;
     if (confidence >= 4) d = 4;
-    if (d > current_degree) d = current_degree;
-    if (d < MIN_DEGREE) d = MIN_DEGREE;
+
+    if (d > current_degree)
+        d = current_degree;
+
+    if (d < MIN_DEGREE)
+        d = MIN_DEGREE;
+
     return d;
 }
 
+/* ================= Accuracy throttle ================= */
+
 static void update_degree(CACHE* cache)
 {
-#if FIX_THROTTLE
-    uint64_t useful_now = cache->pf_useful, useless_now = cache->pf_useless;
-    uint64_t useful  = useful_now  - last_pf_useful;
-    uint64_t useless = useless_now - last_pf_useless;
-    last_pf_useful = useful_now; last_pf_useless = useless_now;
-    uint64_t total = useful + useless;
+#if THROTTLE_MODE == 1
 
-    if (throttle_counter < THROTTLE_WINDOW) return;
-    throttle_counter = 0;
-    if (total < 8) return;
+    uint64_t u_now = cache->pf_useful;
+    uint64_t l_now = cache->pf_useless;
+
+    if (u_now < last_pf_useful ||
+        l_now < last_pf_useless) {
+
+        last_pf_useful = u_now;
+        last_pf_useless = l_now;
+
+        return;
+    }
+
+    uint64_t useful =
+        u_now - last_pf_useful;
+
+    uint64_t useless =
+        l_now - last_pf_useless;
+
+    uint64_t total =
+        useful + useless;
+
+    if (total < THR_WINDOW)
+        return;
+
+    last_pf_useful = u_now;
+    last_pf_useless = l_now;
+
     throttle_evals++;
 
-    double acc = 100.0 * (double)useful / (double)total;
-    if (acc >= ACC_DEGREE_4 + HYSTERESIS) { if (current_degree < 4) current_degree++; }
-    else if (acc >= ACC_DEGREE_3 + HYSTERE< 3) current_degree++; }
+    uint32_t acc =
+        (uint32_t)(useful * 100 / total);
+
+    if (acc >= THR_INC_ACC &&
+        current_degree < MAX_DEGREE) {
+
+        current_degree++;
+        throttle_ups++;
+    }
+    else if (acc < THR_DEC_ACC &&
+             current_degree > MIN_DEGREE) {
+
+        current_degree--;
+        throttle_downs++;
+    }
+
+#elif THROTTLE_MODE == 2
+
+    uint64_t useful_now =
+        cache->pf_useful;
+
+    uint64_t useless_now =
+        cache->pf_useless;
+
+    uint64_t useful =
+        useful_now - last_pf_useful;
+
+    uint64_t useless =
+        useless_now - last_pf_useless;
+
+    last_pf_useful = useful_now;
+    last_pf_useless = useless_now;
+
+    uint64_t total =
+        useful + useless;
+
+    if (throttle_counter < LEGACY_WINDOW)
+        return;
+
+    throttle_counter = 0;
+
+    if (total < 8)
+        return;
+
+    throttle_evals++;
+
+    double acc =
+        100.0 * (double)useful /
+        (double)total;
+
+    if (acc >= ACC_DEGREE_4 + HYSTERESIS) {
+
+        if (current_degree < 4)
+            current_degree++;
+    }
+    else if (acc >= ACC_DEGREE_3 + HYSTERESIS) {
+
+        if (current_degree < 3)
+            current_degree++;
+    }
     else if (acc >= ACC_DEGREE_2 + HYSTERESIS) {
-        if (current_degree < 2) current_degree++;
-        else if (current_degree > 3) current_degree--;
-    } else if (acc < ACC_DEGREE_1) { if (current_degree > MIN_DEGREE) current_degree--; }
+
+        if (current_degree < 2)
+            current_degree++;
+        else if (current_degree > 3)
+            current_degree--;
+    }
+    else if (acc < ACC_DEGREE_1) {
+
+        if (current_degree > MIN_DEGREE)
+            current_degree--;
+    }
+
+#else
+
+    (void)cache;
+
 #endif
 }
 
 /* ================= Issue ================= */
-static bool try_issue(CACHE* cache, uint64_t ip, uint64_t base_addr, uint64_t target_cl)
+
+static int try_issue_ex(CACHE* cache,
+                        uint64_t ip,
+                        uint64_t base_addr,
+                        uint64_t target_cl)
 {
-    uint64_t pf_addr = target_cl * BLOCK_SIZE;
+    uint64_t pf_addr =
+        target_cl * BLOCK_SIZE;
+
     attempted_prefetches++;
 
+    if (filter_contains(target_cl)) {
+
+        filtered_duplicates++;
+
+        return 2;
+    }
+
+#if !FIX_FILTER_INSERT
+    filter_insert(target_cl);
+#endif
+
+    int result =
+        cache->prefetch_line(ip,
+                             base_addr,
+                             pf_addr,
+                             FILL_L1,
+                             0);
+
+    if (result != 0) {
+
+#if FIX_FILTER_INSERT
+        filter_insert(target_cl);
+#endif
+
+        issued_prefetches++;
+
+#if SPP_PROFILE
+
+        prof_issued[prof_src]++;
+
+        {
+            PROF_ENT &pe3 =
+                prof_tab[target_cl & 2047];
+
+            pe3.valid = 1;
+            pe3.src = prof_src;
+            pe3.line = target_cl;
+        }
+
+#endif
+
+        return 1;
+    }
+
+    return 0;
 }
 
-/* Returns the number of prefetches the cache accepted. */
-static uint32_t issue_prefetches(CACHE* cache, uint64_t ip, uint64_t base_addr,
-                                 int stride, uint32_t degree)
+static bool try_issue(CACHE* cache,
+                      uint64_t ip,
+                      uint64_t base_addr,
+                      uint64_t target_cl)
 {
-    if (stride == 0) return 0;
-    degree = std::min(degree, (uint32_t)MAX_DEGREE);
+    return try_issue_ex(cache,
+                        ip,
+                        base_addr,
+                        target_cl) == 1;
+}
 
-    uint64_t base_cl = base_addr / BLOCK_SIZE;
+static uint32_t issue_prefetches(CACHE* cache,
+                                 uint64_t ip,
+                                 uint64_t base_addr,
+                                 int stride,
+                                 uint32_t degree)
+{
+    if (stride == 0)
+        return 0;
+
+    degree =
+        std::min(degree,
+                 (uint32_t)MAX_DEGREE);
+
+    uint64_t base_cl =
+        base_addr / BLOCK_SIZE;
+
     uint32_t actual = 0;
 
-    for (uint32_t d = 1; d <= degree; d++) {
-        int64_t t = (int64_t)base_cl + (in
-    uint64_t cur = cl;
-    uint32_t actual = 0;
+    for (uint32_t d = 1;
+         d <= degree;
+         d++) {
 
-    for (uint32_t d = 1; d <= current_degree; d++) {
-        PATTERN_ENTRY* e = find_pattern(tracker, sig);
-        if (!e || e->confidence < 2 || e->next_stride == 0) break;
-        int64_t t = (int64_t)cur + e->next_stride;
-        if (t < 0) break;
-        if (!same_page(addr, (uint64_t)t * BLOCK_SIZE)) { page_blocked++; break; }
-        if (try_issue(cache, ip, addr, (uint64_t)t)) actual++;
-        sig = update_signature(sig, e->next_stride);
-        cur = (uint64_t)t;
-    }
-    if (actual > 0) degree_used[actual]++;
+        int64_t t =
+            (int64_t)base_cl +
+            (int64_t)stride *
+            (int64_t)d;
 
-    for (int i = 0; i < PAGE_ENTRIES; i++)
-        if (page_table[i].valid && page_table[i].page == page) { e = &page_table[i]; break; }
+        if (t < 0) {
 
-    if (e == NULL) {                       /* allocate: invalid entry, else oldest */
-        int v = 0;
-        for (int i = 0; i < PAGE_ENTRIES; i++) {
-            if (!page_table[i].valid) { v = i; break; }
-            if (page_table[i].stamp < page_table[v].stamp) v = i;
+            rejected_predictions++;
+
+            continue;
         }
+
+        if (!same_page(base_addr,
+                       (uint64_t)t * BLOCK_SIZE)) {
+
+            page_blocked++;
+
+            break;
+        }
+
+        if (try_issue(cache,
+                      ip,
+                      base_addr,
+                      (uint64_t)t))
+            actual++;
+    }
+
+    if (actual > 0)
+        degree_used[actual]++;
+
+    return actual;
+}
+
+#if FRONTIER
+
+static uint32_t issue_frontier(CACHE* cache,
+                               IP_TRACKER* t,
+                               uint64_t ip,
+                               uint64_t addr,
+                               uint64_t cl,
+                               int stride,
+                               uint32_t cap)
+{
+    int64_t base =
+        (int64_t)cl;
+
+    int64_t sgn =
+        stride > 0 ? 1 : -1;
+
+    int64_t astr =
+        stride > 0 ? stride : -stride;
+
+    int64_t ahead =
+        (int64_t)current_degree *
+        AHEAD_MULT;
+
+    int64_t limit =
+        base +
+        (int64_t)stride *
+        ahead;
+
+    bool reset =
+        !t->fr_valid ||
+        t->fr_stride != stride;
+
+    if (!reset) {
+
+        int64_t fwd =
+            ((int64_t)t->frontier - base) *
+            sgn;
+
+        if (fwd < 0 ||
+            fwd > astr * ahead)
+            reset = true;
+    }
+
+    if (reset) {
+
+        t->frontier = cl;
+        t->fr_valid = 1;
+        t->fr_stride = (int8_t)stride;
+    }
+
+    uint32_t actual = 0;
+
+    for (int64_t i = 0;
+         i < ahead && actual < cap;
+         i++) {
+
+        int64_t next =
+            (int64_t)t->frontier +
+            stride;
+
+        if ((limit - next) * sgn < 0)
+            break;
+
+        if (next < 0)
+            break;
+
+        if (!same_page(addr,
+                       (uint64_t)next * BLOCK_SIZE)) {
+
+            page_blocked++;
+
+            break;
+        }
+
+        int r =
+            try_issue_ex(cache,
+                         ip,
+                         addr,
+                         (uint64_t)next);
+
+        if (r == 0)
+            break;
+
+        t->frontier =
+            (uint64_t)next;
+
+        if (r == 1)
+            actual++;
+    }
+
+    if (actual > 0)
+        degree_used[actual]++;
+
+    return actual;
+}
+
+#endif
+
+#if FIX_PATTERN
+
+static uint32_t issue_pattern_frontier(CACHE* cache,
+                                       IP_TRACKER* t,
+                                       uint64_t ip,
+                                       uint64_t addr,
+                                       uint64_t cl)
+{
+    PROF_SRC(2);
+
+    int64_t maxsteps = PAT_DEPTH;
+
+    if (maxsteps > 31)
+        maxsteps = 31;
+
+    if (t->pf_valid &&
+        !same_page(addr,
+                   t->pf_line * BLOCK_SIZE))
+        t->pf_valid = 0;
+
+    if (t->pf_valid) {
+
+        if (t->pf_steps > 0)
+            t->pf_steps--;
+    }
+
+    if (!t->pf_valid ||
+        t->pf_steps == 0) {
+
+        t->pf_line = cl;
+        t->pf_sig = t->signature;
+        t->pf_steps = 0;
+        t->pf_valid = 1;
+    }
+
+    uint32_t actual = 0;
+
+    while (t->pf_steps < maxsteps &&
+           actual < current_degree) {
+
+        PATTERN_ENTRY* e =
+            find_pattern(t,
+                         t->pf_sig);
+
+        if (!e ||
+            e->confidence < PAT_CONF_MIN ||
+            e->next_stride == 0)
+            break;
+
+        int64_t nl =
+            (int64_t)t->pf_line +
+            e->next_stride;
+
+        if (nl < 0)
+            break;
+
+        if (!same_page(addr,
+                       (uint64_t)nl * BLOCK_SIZE)) {
+
+            page_blocked++;
+
+            break;
+        }
+
+        int r =
+            try_issue_ex(cache,
+                         ip,
+                         addr,
+                         (uint64_t)nl);
+
+        if (r == 0)
+            break;
+
+        t->pf_line =
+            (uint64_t)nl;
+
+        t->pf_sig =
+            update_signature(t->pf_sig,
+                             e->next_stride);
+
+        t->pf_steps++;
+
+        if (r == 1)
+            actual++;
+    }
+
+    if (actual > 0)
+        degree_used[actual]++;
+
+    pattern_predictions++;
+
+    return actual;
+}
+
+#endif
+
+/* ================= Page-local delta predictor ================= */
+
+#if PAGE_PRED
+
+#if FOOTPRINT
+
+static inline uint16_t fp_key(uint64_t ip,
+                              int off)
+{
+    uint64_t k =
+        (ip >> 2) ^
+        (ip >> 10) ^
+        (ip >> 18) ^
+        ((uint64_t)off * 0x4F1B);
+
+    return (uint16_t)(k & 0xFFFF);
+}
+
+static void fp_train(const PAGE_ENTRY* v)
+{
+    if (!v->valid ||
+        __builtin_popcountll(v->bitmap) < FP_MIN_LINES)
+        return;
+
+    FP_ENTRY &f =
+        fp_tab[v->key & (FP_ENTRIES - 1)];
+
+    uint8_t tag =
+        (uint8_t)(v->key >> 8);
+
+    fp_trained++;
+
+    if (f.valid &&
+        f.tag == tag) {
+
+        int ov =
+            __builtin_popcountll(
+                f.fp & v->bitmap);
+
+        if (2 * ov >=
+            __builtin_popcountll(v->bitmap)) {
+
+            if (f.conf < 3)
+                f.conf++;
+        }
+        else if (f.conf > 0) {
+
+            f.conf--;
+        }
+
+        f.fp = v->bitmap;
+    }
+    else {
+
+        f.valid = 1;
+        f.tag = tag;
+        f.fp = v->bitmap;
+        f.conf = 0;
+    }
+}
+
+#endif
+
+static PAGE_ENTRY* page_train(uint64_t addr,
+                              uint64_t ip)
+{
+    g_page_new = false;
+
+    uint64_t page =
+        addr >> 12;
+
+    int off =
+        (int)((addr >> 6) & 63);
+
+    PAGE_ENTRY* e = NULL;
+
+    page_clock++;
+
+    for (int i = 0;
+         i < PAGE_ENTRIES;
+         i++) {
+
+        if (page_table[i].valid &&
+            page_table[i].page == page) {
+
+            e = &page_table[i];
+
+            break;
+        }
+    }
+
+    if (e == NULL) {
+
+        int v = 0;
+
+        for (int i = 0;
+             i < PAGE_ENTRIES;
+             i++) {
+
+            if (!page_table[i].valid) {
+
+                v = i;
+
+                break;
+            }
+
+            if (page_table[i].stamp <
+                page_table[v].stamp)
+                v = i;
+        }
+
         e = &page_table[v];
-        e->valid = 1; e->page = page; e->last_off = (int8_t)off;
-        e->last_delta = 0; e->conf = 0; e->stamp = page_clock;
+
+#if FOOTPRINT
+
+        fp_train(e);
+
+        e->bitmap =
+            1ULL << off;
+
+        e->pending = 0;
+
+        e->key =
+            fp_key(ip, off);
+
+#endif
+
+        g_page_new = true;
+
+#if SPP_PROFILE
+        prof_page_new = true;
+#endif
+
+        e->valid = 1;
+        e->page = page;
+        e->last_off = (int8_t)off;
+        e->last_delta = 0;
+        e->conf = 0;
+        e->stamp = page_clock;
+
         return e;
     }
 
     e->stamp = page_clock;
-    int delta = off - (int)e->last_off;
-    e->last_off = (int8_t)off;
-    if (delta == 0) return e;
+
+#if FOOTPRINT
+    e->bitmap |=
+        1ULL << off;
+#endif
+
+    int delta =
+        off - (int)e->last_off;
+
+    e->last_off =
+        (int8_t)off;
+
+    if (delta == 0)
+        return e;
 
     if (delta == e->last_delta) {
-        if (e->conf < 3) e->conf++;
-    } else if (e->conf > 0) {
+
+        if (e->conf < 3)
+            e->conf++;
+    }
+    else if (e->conf > 0) {
+
         e->conf--;
-    } else {
-        e->last_delta = (int8_t)delta;
+    }
+    else {
+
+        e->last_delta =
+            (int8_t)delta;
+
         e->conf = 1;
     }
+
     return e;
 }
 
-static void page_issue(CACHE* cache, uint64_t ip, uint64_t addr, PAGE_ENTRY* e)
+static void page_issue(CACHE* cache,
+                       uint64_t ip,
+                       uint64_t addr,
+                       PAGE_ENTRY* e)
 {
-    if (e->conf < PAGE_CONF_TH || e->last_delta == 0) return;
+    if (e->conf < PAGE_CONF_TH ||
+        e->last_delta == 0)
+        return;
 
     page_predictions++;
-    uint64_t cl = addr / BLOCK_SIZE;
-    int off = (int)(cl & 63);
-    IP_TRACKER* tracker = find_tracker(ip);
 
-    if (tracker->last_cl == 0) { tracker->last_cl = cl; return false; }
+    PROF_SRC(3);
 
-    int64_t stride64 = (int64_t)cl - (int64_t)tracker->last_cl;
-    if (stride64 == 0) { tracker->last_cl = cl; return false; }
+    uint64_t cl =
+        addr / BLOCK_SIZE;
 
-    if (stride64 > 127 || stride64 < -128) {
-        tracker->last_cl = cl; tracker->last_stride = 0;
-        tracker->uniform_confidence = 0; tracker->pattern_confidence = 0;
-        tracker->signature = 0;
+    int off =
+        (int)(cl & 63);
+
+    uint64_t page_base_cl =
+        cl - (uint64_t)off;
+
+    for (int i = 1;
+         i <= PAGE_DEGREE;
+         i++) {
+
+        int o =
+            off +
+            (int)e->last_delta * i;
+
+        if (o < 0 || o > 63)
+            break;
+
+        if (try_issue(cache,
+                      ip,
+                      addr,
+                      page_base_cl +
+                      (uint64_t)o))
+            page_issued++;
+    }
+}
+
+#endif
+
+#if FOOTPRINT
+
+static void fp_step(CACHE* cache,
+                    uint64_t ip,
+                    uint64_t addr,
+                    PAGE_ENTRY* e,
+                    bool is_new)
+{
+    int off =
+        (int)((addr >> 6) & 63);
+
+    if (is_new) {
+
+        fp_triggers++;
+
+        FP_ENTRY &f =
+            fp_tab[e->key &
+                   (FP_ENTRIES - 1)];
+
+        if (f.valid &&
+            f.tag ==
+                (uint8_t)(e->key >> 8) &&
+            f.conf >= FP_CONF_MIN) {
+
+            e->pending =
+                f.fp & ~(1ULL << off);
+
+            fp_trig_hits++;
+        }
+    }
+
+    e->pending &=
+        ~e->bitmap;
+
+    if (!e->pending)
+        return;
+
+    PROF_SRC(4);
+
+    uint32_t budget =
+        is_new ? FP_BURST :
+                 FP_PER_ACCESS;
+
+    uint32_t done = 0;
+
+    uint64_t page_base_cl =
+        (addr >> 12) << 6;
+
+    for (int d = 1;
+         d < 64 &&
+         done < budget &&
+         e->pending;
+         d++) {
+
+        for (int sg = 0;
+             sg < 2 &&
+             done < budget;
+             sg++) {
+
+            int o =
+                sg ? off - d
+                    : off + d;
+
+            if (o < 0 ||
+                o > 63 ||
+                !((e->pending >> o) & 1ULL))
+                continue;
+
+            int r =
+                try_issue_ex(cache,
+                             ip,
+                             addr,
+                             page_base_cl +
+                             (uint64_t)o);
+
+            if (r == 0)
+                return;
+
+            e->pending &=
+                ~(1ULL << o);
+
+            if (r == 1) {
+
+                done++;
+                fp_issued++;
+            }
+        }
+    }
+}
+
+#endif
+
+/* ================= Per-IP stage ================= */
+
+static bool ip_stage(CACHE* cache,
+                     uint64_t addr,
+                     uint64_t ip,
+                     uint64_t cl)
+{
+    IP_TRACKER* tracker =
+        find_tracker(ip);
+
+    if (tracker->last_cl == 0) {
+
+        PROF_CLASS(2);
+
+        tracker->last_cl = cl;
+
         return false;
     }
 
-    int stride = (int)stride64;
-    uint16_t old_signature = tracker->signature;
+    int64_t stride64 =
+        (int64_t)cl -
+        (int64_t)tracker->last_cl;
+
+    if (stride64 == 0) {
+
+        PROF_CLASS(7);
+
+        tracker->last_cl = cl;
+
+        return false;
+    }
+
+    if (stride64 > 127 ||
+        stride64 < -128) {
+
+        PROF_CLASS(3);
+
+        tracker->last_cl = cl;
+        tracker->last_stride = 0;
+        tracker->uniform_confidence = 0;
+        tracker->pattern_confidence = 0;
+        tracker->signature = 0;
+
+        reset_frontier(tracker);
+
+        return false;
+    }
+
+    int stride =
+        (int)stride64;
+
+    uint16_t old_signature =
+        tracker->signature;
+
+#if SPP_PROFILE
+
+    {
+        PATTERN_ENTRY* pr =
+            find_pattern(tracker,
+                         old_signature);
+
+        if (stride ==
+            tracker->last_stride)
+            prof_class = 4;
+
+        else if (pr &&
+                 pr->confidence >= 1 &&
+                 pr->next_stride == stride)
+            prof_class = 5;
+
+        else
+            prof_class = 6;
+    }
+
+#endif
+
     uint32_t issued = 0;
 
-    train_pattern(tracker, old_signature, stride);
+#if FIX_PATTERN
 
-    if (stride == tracker->last_stride) {
-        if (tracker->uniform_confidence < UNIFORM_CONF_MAX) tracker->uniform_confidence++;
-    } else {
-        if (tracker->uniform_confidence > 0) tracker->uniform_confidence--;
-        if (tracker->uniform_confidence == 0) tracker->uniform_confidence = 1;
+    {
+        PATTERN_ENTRY* pre =
+            find_pattern(tracker,
+                         old_signature);
+
+        if (tracker->pf_valid &&
+            (pre == NULL ||
+             pre->next_stride != stride))
+            tracker->pf_valid = 0;
     }
 
-        PATTERN_ENTRY* e = find_pattern(tracker, old_signature);
-        if (e != NULL && e->valid && e->confidence >= 1 && e->next_stride != 0) {
-            uint32_t degree = get_prediction_degree(e->confidence);
-            if (e->confidence == 1) degree = 1;
-            pattern_predictions++;
-            issued += issue_prefetches(cache, ip, addr, e->next_stride, degree);
-            tracker->pattern_confidence = e->confidence;
-        }
-    }
 #endif
 
-    tracker->signature = update_signature(old_signature, stride);
+    train_pattern(tracker,
+                  old_signature,
+                  stride);
+
+    if (stride ==
+        tracker->last_stride) {
+
+        if (tracker->uniform_confidence <
+            UNIFORM_CONF_MAX)
+            tracker->uniform_confidence++;
+    }
+    else {
+
+        if (tracker->uniform_confidence > 0)
+            tracker->uniform_confidence--;
+
+        if (tracker->uniform_confidence == 0)
+            tracker->uniform_confidence = 1;
+    }
+
+    bool uniform =
+        (tracker->last_stride == stride &&
+         tracker->uniform_confidence >= UNIFORM_TH);
+
+    if (uniform) {
+
+        if ((stride == 1 ||
+             stride == -1) &&
+            tracker->uniform_confidence >= 3)
+            stream_predictions++;
+        else
+            uniform_predictions++;
+
+        PROF_SRC(0);
+
+        uint32_t cap =
+            get_prediction_degree(
+                tracker->uniform_confidence);
+
+#if FRONTIER
+
+        issued +=
+            issue_frontier(cache,
+                            tracker,
+                            ip,
+                            addr,
+                            cl,
+                            stride,
+                            cap);
+
+#else
+
+        issued +=
+            issue_prefetches(cache,
+                             ip,
+                             addr,
+                             stride,
+                             cap);
+
+#endif
+
+    }
+    else {
+
+        reset_frontier(tracker);
+
+#if !FIX_PATTERN
+
+        PATTERN_ENTRY* e =
+            find_pattern(tracker,
+                         old_signature);
+
+        if (e != NULL &&
+            e->valid &&
+            e->confidence >= 1 &&
+            e->next_stride != 0) {
+
+            uint32_t degree =
+                get_prediction_degree(
+                    e->confidence);
+
+            if (e->confidence == 1)
+                degree = 1;
+
+            PROF_SRC(
+                e->confidence >= 2 ? 2 : 1);
+
+            pattern_predictions++;
+
+            issued +=
+                issue_prefetches(
+                    cache,
+                    ip,
+                    addr,
+                    e->next_stride,
+                    degree);
+
+            tracker->pattern_confidence =
+                e->confidence;
+        }
+
+#endif
+    }
+
+    tracker->signature =
+        update_signature(old_signature,
+                         stride);
 
 #if FIX_PATTERN
+
+    if (!uniform)
+        issued +=
+            issue_pattern_frontier(
+                cache,
+                tracker,
+                ip,
+                addr,
+                cl);
+
 #endif
 
-    tracker->last_stride = (int8_t)stride;
-    tracker->last_cl = cl;
+    tracker->last_stride =
+        (int8_t)stride;
+
+    tracker->last_cl =
+        cl;
+
     return issued > 0;
 }
 
 /* ================= Hooks ================= */
+
 void CACHE::l1d_prefetcher_initialize()
 {
-    for (uint32_t s = 0; s < IP_SETS; s++)
-        for (uint32_t w = 0; w < IP_WAYS; w++) {
-            IP_TRACKER &t = ip_table[s][w];
-            t.valid = 0; t.ip = 0; t.last_
-            t.uniform_confidence = 0; t.pattern_confidence = 0;
-            t.signature = 0; t.lru = w;
-            for (uint32_t p = 0; p < PATTERN_TABLE_SIZE; p++) {
-                t.pattern[p].valid = 0; t.
-                t.pattern[p].next_stride =e = 0;
+    for (uint32_t s = 0;
+         s < IP_SETS;
+         s++) {
+
+        for (uint32_t w = 0;
+             w < IP_WAYS;
+             w++) {
+
+            IP_TRACKER &t =
+                ip_table[s][w];
+
+            t.valid = 0;
+            t.ip = 0;
+            t.last_cl = 0;
+            t.last_stride = 0;
+            t.uniform_confidence = 0;
+            t.pattern_confidence = 0;
+            t.signature = 0;
+            t.lru = w;
+
+            reset_frontier(&t);
+
+            for (uint32_t p = 0;
+                 p < PATTERN_TABLE_SIZE;
+                 p++) {
+
+                t.pattern[p].valid = 0;
+                t.pattern[p].signature = 0;
+                t.pattern[p].next_stride = 0;
+                t.pattern[p].confidence = 0;
             }
         }
-    for (int i = 0; i < PAGE_ENTRIES; i++) page_table[i].valid = 0;
+    }
+
+    for (int i = 0;
+         i < PAGE_ENTRIES;
+         i++) {
+
+        page_table[i].valid = 0;
+        page_table[i].bitmap = 0;
+        page_table[i].pending = 0;
+    }
+
+    for (int i = 0;
+         i < FP_ENTRIES;
+         i++)
+        fp_tab[i].valid = 0;
+
+    fp_trained =
+        fp_triggers =
+        fp_trig_hits =
+        fp_issued = 0;
+
     page_clock = 0;
 
-    for (uint32_t i = 0; i < FILTER_SIZE; ; filter_valid[i] = 0; }
+    for (uint32_t i = 0;
+         i < FILTER_SIZE;
+         i++) {
+
+        filter_table[i] = 0;
+        filter_valid[i] = 0;
+    }
 
     current_degree = START_DEGREE;
     throttle_counter = 0;
-    attempted_prefetches = issued_prefetches = 0;
-    uniform_predictions = pattern_predictions = stream_predictions = 0;
-    page_predictions = page_issued = 0;
-    filtered_duplicates = page_blocked = rejected_predictions = 0;
-    throttle_evals = 0;
-    last_pf_useful = last_pf_useless = 0;
-    for (uint32_t i = 0; i <= MAX_DEGREE; i++) degree_used[i] = 0;
 
-    std::cout << "------------------------<< std::endl;
+    for (uint32_t i = 0;
+         i <= MAX_DEGREE;
+         i++)
+        degree_time[i] = 0;
+
+    attempted_prefetches =
+        issued_prefetches = 0;
+
+    uniform_predictions =
+        pattern_predictions =
+        stream_predictions = 0;
+
+    page_predictions =
+        page_issued = 0;
+
+    filtered_duplicates =
+        page_blocked =
+        rejected_predictions = 0;
+
+    throttle_evals =
+        throttle_ups =
+        throttle_downs = 0;
+
+    last_pf_useful =
+        last_pf_useless = 0;
+
+    for (uint32_t i = 0;
+         i <= MAX_DEGREE;
+         i++)
+        degree_used[i] = 0;
+
+    std::cout
+        << "------------------------------------------------"
+        << std::endl;
+
+    std::cout
+        << "   IP-based SPP + page-delta predictor (v6)"
+        << std::endl;
+
+    std::cout
+        << "------------------------------------------------"
+        << std::endl;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr,
+                                   uint64_t ip,
+                                   uint8_t cache_hit,
+                                   uint8_t type,
+                                   uint8_t critical_ip_flag)
+{
+#if TYPE_FILTER
+
+    if (type != LOAD &&
+        type != RFO)
+        return;
+
 #endif
 
-    bool issued = ip_stage(this, addr, ip, cl);
+    uint64_t cl =
+        addr / BLOCK_SIZE;
+
+#if SPP_PROFILE
+
+    prof_page_new = false;
+    prof_class = 0;
+
+    bool prof_was_pf = false;
+
+    if (type == LOAD) {
+
+        prof_demand_loads++;
+
+        PROF_ENT &pq =
+            prof_tab[cl & 2047];
+
+        if (pq.valid &&
+            pq.line == cl) {
+
+            prof_was_pf = true;
+
+            if (cache_hit)
+                prof_touch_hit[pq.src]++;
+            else
+                prof_touch_miss[pq.src]++;
+
+            pq.valid = 0;
+        }
+    }
+
+#endif
 
 #if PAGE_PRED
-    if (!issued) page_issue(this, ip, addr, pe);   /* fallback only */
+
+    PAGE_ENTRY* pe =
+        page_train(addr, ip);
+
+#endif
+
+    bool issued =
+        ip_stage(this,
+                 addr,
+                 ip,
+                 cl);
+
+#if PAGE_PRED
+
+    if (!issued)
+        page_issue(this,
+                   ip,
+                   addr,
+                   pe);
+
+#if FOOTPRINT
+
+    fp_step(this,
+            ip,
+            addr,
+            pe,
+            g_page_new);
+
+#endif
+
+#endif
+
+#if SPP_PROFILE
+
+    if (type == LOAD &&
+        !cache_hit) {
+
+        prof_demand_miss++;
+
+        int c =
+            prof_was_pf
+            ? 8
+            : (prof_page_new
+               ? 1
+               : prof_class);
+
+        miss_class[c]++;
+    }
+
 #endif
 
     throttle_counter++;
+
+    degree_time[current_degree]++;
+
     update_degree(this);
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
-                                      uint32_t set, uint32_t way, uint8_t prefetch,
-                                      uint4_t evicted_addr,
-              << " PATTERN=" << FIX_PATTERN
-              << " UNIFORM_TH=" << UNIFORM_TH
-              << " IP_WAYS=" << IP_WAYS << "\n";
-    std::cout << "Attempted prefetches : " << attempted_prefetches << "\n";
-    std::cout << "Issued prefetches    : " << issued_prefetches << "\n";
-    std::cout << "Filtered duplicates  : " << filtered_duplicates << "\n";
-    std::cout << "Page-blocked         : " << page_blocked << "\n";
-    std::cout << "Uniform predictions  : " << uniform_predictions << "\n";
-    std::cout << "Pattern predictions  : " << pattern_predictions << "\n";
-    std::cout << "Stream predictions   : " << stream_predictions << "\n";
-    std::cout << "Page-delta fires     : " << page_predictions << "\n";
-    std::cout << "Page-delta issued    : " << page_issued << "\n";
-    std::cout << "Throttle evaluations : " << throttle_evals << "\n";
-    std::cout << "Final degree         : " << current_degree << "\n";
-    for (uint32_t d = 1; d <= MAX_DEGREE;
-        std::cout << "Degree " << d << " uses        : " << degree_used[d] << "\n";
+void CACHE::l1d_prefetcher_cache_fill(
+    uint64_t v_addr,
+    uint64_t addr,
+    uint32_t set,
+    uint32_t way,
+    uint8_t prefetch,
+    uint64_t v_evicted_addr,
+    uint64_t evicted_addr,
+    uint32_t metadata_in)
+{
+}
 
-    /* The struct stores a full 64-bit IP and line address for simulation
-       convenience; hardware would use parosted at
-       1 + 16 + 6 + 7 + 2 + 6 = 38 bits. */
-    uint64_t pattern_entry_bits = 1 + SIG_BITS + 8 + 2;
-    uint64_t tracker_bits = (1 + 64 + 64 + 8 + 3 + 2 + SIG_BITS + 2) +
-                            PATTERN_TABLE_
-    uint64_t ip_total   = (uint64_t)IP_SETS * IP_WAYS * tracker_bits;
-    uint64_t page_bits  = PAGE_PRED ? (uint64_t)PAGE_ENTRIES * 38 : 0;
-    uint64_t filter_bits = FILTER_SIZE * 64 + FILTER_SIZE;
-    uint64_t total = ip_total + page_bits + filter_bits + 3 + 64 * 2;
+void CACHE::l1d_prefetcher_final_stats()
+{
+    std::cout
+        << "\n===== SPP v6 =====\n";
 
-    std::cout << "\n===== SPP STORAGE =====\n";
-    std::cout << "IP table   : " << ip_total << " bits\n";
-    std::cout << "Page table : " << page_bits << " bits\n";
-    std::cout << "TOTAL      : " << total << " bits ("
-              << ((double)total / 8192.0) << " KiB)\n";
+    std::cout
+        << "Switches: PAGE_PRED=" << PAGE_PRED
+        << " TYPE_FILTER=" << TYPE_FILTER
+        << " FRONTIER=" << FRONTIER
+        << " FIX_PATTERN=" << FIX_PATTERN
+        << " AHEAD_MULT=" << AHEAD_MULT
+        << " FOOTPRINT=" << FOOTPRINT
+        << " FP_ENTRIES=" << FP_ENTRIES
+        << " FP_CONF_MIN=" << FP_CONF_MIN
+        << " FP_BURST=" << FP_BURST
+        << " THROTTLE_MODE=" << THROTTLE_MODE
+        << " IP_SETS=" << IP_SETS
+        << " IP_INSERT_LRU=" << IP_INSERT_LRU
+        << " PAT_DEPTH=" << PAT_DEPTH
+        << " PAT_CONF_MIN=" << PAT_CONF_MIN
+        << " PAGE_ENTRIES=" << PAGE_ENTRIES
+        << " THR_WINDOW=" << THR_WINDOW
+        << " THR_DEC/INC="
+        << THR_DEC_ACC << "/"
+        << THR_INC_ACC
+        << " UNIFORM_TH=" << UNIFORM_TH
+        << "\n";
+
+    std::cout
+        << "Attempted prefetches : "
+        << attempted_prefetches
+        << "\n";
+
+    std::cout
+        << "Issued prefetches    : "
+        << issued_prefetches
+        << "\n";
+
+    std::cout
+        << "Filtered duplicates  : "
+        << filtered_duplicates
+        << "\n";
+
+    std::cout
+        << "Page-blocked         : "
+        << page_blocked
+        << "\n";
+
+    std::cout
+        << "Uniform predictions  : "
+        << uniform_predictions
+        << "\n";
+
+    std::cout
+        << "Pattern predictions  : "
+        << pattern_predictions
+        << "\n";
+
+    std::cout
+        << "Stream predictions   : "
+        << stream_predictions
+        << "\n";
+
+    std::cout
+        << "Page-delta fires     : "
+        << page_predictions
+        << "\n";
+
+    std::cout
+        << "Page-delta issued    : "
+        << page_issued
+        << "\n";
+
+#if FOOTPRINT
+
+    std::cout
+        << "Footprint: generations trained "
+        << fp_trained
+        << ", trigger lookups "
+        << fp_triggers
+        << ", predicted "
+        << fp_trig_hits
+        << ", lines issued "
+        << fp_issued
+        << "\n";
+
+#endif
+
+    std::cout
+        << "Throttle evaluations : "
+        << throttle_evals
+        << " (up "
+        << throttle_ups
+        << ", down "
+        << throttle_downs
+        << ")\n";
+
+    std::cout
+        << "Final degree         : "
+        << current_degree
+        << "\n";
+
+    for (uint32_t d = 1;
+         d <= MAX_DEGREE;
+         d++) {
+
+        std::cout
+            << "Accesses at degree "
+            << d
+            << " : "
+            << degree_time[d]
+            << "\n";
+    }
+
+    for (uint32_t d = 1;
+         d <= MAX_DEGREE;
+         d++) {
+
+        std::cout
+            << "Degree "
+            << d
+            << " uses        : "
+            << degree_used[d]
+            << "\n";
+    }
+
+#if SPP_PROFILE
+
+    {
+        const char* sn[5] = {
+            "uniform/stream",
+            "pattern conf=1",
+            "pattern conf>=2",
+            "page-delta",
+            "footprint"
+        };
+
+        const char* cn[9] = {
+            "unclassified",
+            "first touch of page",
+            "new/evicted IP tracker",
+            "far jump (>127 lines)",
+            "stride repeated, not covered",
+            "pattern predicted, not covered",
+            "irregular in-range stride",
+            "same line as last",
+            "prefetched but still missed"
+        };
+
+        std::cout
+            << "\n===== SPP PROFILE =====\n";
+
+        std::cout
+            << "Demand loads seen: "
+            << prof_demand_loads
+            << "  demand load misses seen: "
+            << prof_demand_miss
+            << "\n";
+
+        std::cout
+            << "source             issued   touched_hit touched_miss\n";
+
+        for (int i = 0; i < 5; i++)
+            std::cout
+                << sn[i]
+                << "  "
+                << prof_issued[i]
+                << "  "
+                << prof_touch_hit[i]
+                << "  "
+                << prof_touch_miss[i]
+                << "\n";
+
+        std::cout
+            << "L1D load-miss class (count, % of misses)\n";
+
+        for (int i = 0; i < 9; i++)
+            std::cout
+                << cn[i]
+                << " : "
+                << miss_class[i]
+                << "  ("
+                << (prof_demand_miss
+                    ? 100.0 *
+                      miss_class[i] /
+                      prof_demand_miss
+                    : 0.0)
+                << "%)\n";
+    }
+
+#endif
+
+    /* Storage */
+
+    uint64_t pattern_entry_bits =
+        1 + SIG_BITS + 8 + 2;
+
+    uint64_t frontier_bits =
+        (FRONTIER
+         ? (1 + 6 + 8)
+         : 0)
+        +
+        (FIX_PATTERN
+         ? (1 + 6 + SIG_BITS + 5)
+         : 0);
+
+    uint64_t tracker_bits =
+        (1 + 64 + 64 + 8 + 3 + 2 + SIG_BITS + 2)
+        +
+        frontier_bits
+        +
+        PATTERN_TABLE_SIZE *
+        pattern_entry_bits;
+
+    uint64_t ip_total =
+        (uint64_t)IP_SETS *
+        IP_WAYS *
+        tracker_bits;
+
+    uint64_t page_bits =
+        PAGE_PRED
+        ? (uint64_t)PAGE_ENTRIES * 38
+        : 0;
+
+    if (FOOTPRINT)
+        page_bits +=
+            (uint64_t)PAGE_ENTRIES *
+            (64 + 64 + 16)
+            +
+            (uint64_t)FP_ENTRIES *
+            (1 + 8 + 2 + 64);
+
+    uint64_t filter_bits =
+        FILTER_SIZE * 64 +
+        FILTER_SIZE;
+
+    uint64_t total =
+        ip_total +
+        page_bits +
+        filter_bits +
+        3 +
+        64 * 2;
+
+    std::cout
+        << "\n===== SPP STORAGE =====\n";
+
+    std::cout
+        << "IP table   : "
+        << ip_total
+        << " bits\n";
+
+    std::cout
+        << "Page table : "
+        << page_bits
+        << " bits\n";
+
+    std::cout
+        << "TOTAL      : "
+        << total
+        << " bits ("
+        << ((double)total / 8192.0)
+        << " KiB)\n";
 }
