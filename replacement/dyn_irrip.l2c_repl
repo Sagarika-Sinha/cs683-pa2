@@ -1,230 +1,186 @@
 #include "cache.h"
 
-#define MAX_RRPV 3
+#define maxRRPV 3
 
+// ---------- tunables (override with -D or edit the defaults) ----------
 #ifndef NUM_LEADERS
-#define NUM_LEADERS 16
+#define NUM_LEADERS 32               // leader sets that ALWAYS run plain RRIP
 #endif
-
+#ifndef THRESH_PCT
+#define THRESH_PCT 15                // instruction-share threshold (percent)
+#endif
 #ifndef EPOCH
-#define EPOCH 16384
+#define EPOCH 1024                   // leader events between mode decisions
+#endif
+#ifndef INSTR_MAX_WAYS
+#define INSTR_MAX_WAYS 3             // protect instructions only while they hold <= this many ways
+#endif
+#ifndef INSTR_INSERT_RRPV
+#define INSTR_INSERT_RRPV 1
+#endif
+#ifndef DATA_INSERT_RRPV
+#define DATA_INSERT_RRPV (maxRRPV - 1)
+#endif
+#ifndef PRINT_EVERY
+#define PRINT_EVERY 32               // print a status line every N epochs
 #endif
 
-#ifndef MIN_SAMPLES
-#define MIN_SAMPLES 1024
-#endif
-
-#ifndef PREFETCH_THRESHOLD
-#define PREFETCH_THRESHOLD 50
-#endif
-
-#define LEADER_STRIDE ((L2C_SET >= NUM_LEADERS) ? (L2C_SET / NUM_LEADERS) : 1)
+#define LEADER_STRIDE (L2C_SET / NUM_LEADERS)
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-uint8_t l2_was_prefetch[L2C_SET][L2C_WAY];
 
-static uint64_t demand_hits;
-static uint64_t prefetch_hits;
-static uint64_t demand_accesses;
-static uint64_t prefetch_accesses;
+static uint64_t instr_acc, instr_miss, total_acc, total_miss, leader_events;
+static bool     irrip_mode;
+static uint64_t epochs, epochs_irrip, mode_switches, last_ratio_pct;
+static uint64_t fills_irrip, fills_rrip, capped_evictions;
 
-static uint64_t epoch_accesses;
-static bool prefer_prefetch_victims;
+static inline bool is_leader(uint32_t set) { return (set % LEADER_STRIDE) == 0; }
+static inline bool use_irrip(uint32_t set) { return is_leader(set) ? false : irrip_mode; }
 
-static uint64_t mode_switches;
-static uint64_t prefetch_fills;
-static uint64_t useful_prefetch_hits;
-static uint64_t unused_prefetch_evictions;
-static uint64_t follower_fills_prefetch_mode;
-static uint64_t follower_fills_normal_mode;
-
-static inline bool is_leader(uint32_t set)
+static void print_stats(const char *tag)
 {
-    return (set % LEADER_STRIDE) == 0;
+    cout << "DYN_IRRIP[" << tag << "] epochs=" << epochs
+         << " epochs_irrip=" << epochs_irrip
+         << " mode_switches=" << mode_switches
+         << " last_instr_ratio_pct=" << last_ratio_pct
+         << " mode=" << (irrip_mode ? "IRRIP" : "RRIP")
+         << " follower_fills_irrip=" << fills_irrip
+         << " follower_fills_rrip=" << fills_rrip
+         << " cap_fallbacks=" << capped_evictions << endl;
 }
 
-static void update_mode()
+static void decide_mode()
 {
-    uint64_t total_hits = demand_hits + prefetch_hits;
+    uint64_t num = instr_acc + instr_miss;
+    uint64_t den = total_acc + total_miss;
+    if (den == 0) return;
 
-    if (total_hits < MIN_SAMPLES)
-        return;
+    last_ratio_pct = (num * 100) / den;
+    bool new_mode = (num * 100 > (uint64_t)THRESH_PCT * den);
 
-    uint64_t total_accesses = demand_accesses + prefetch_accesses;
+    epochs++;
+    if (new_mode) epochs_irrip++;
+    if (new_mode != irrip_mode) mode_switches++;
+    irrip_mode = new_mode;
 
-    if (total_accesses == 0)
-        return;
+    instr_acc >>= 1; instr_miss >>= 1; total_acc >>= 1; total_miss >>= 1;
+    leader_events = 0;
 
-    uint64_t useful_pct = (useful_prefetch_hits * 100) /
-                          ((prefetch_fills > 0) ? prefetch_fills : 1);
-
-    bool new_mode = (useful_pct < PREFETCH_THRESHOLD);
-
-    if (new_mode != prefer_prefetch_victims)
-        mode_switches++;
-
-    prefer_prefetch_victims = new_mode;
-
-    demand_hits >>= 1;
-    prefetch_hits >>= 1;
-    demand_accesses >>= 1;
-    prefetch_accesses >>= 1;
-    useful_prefetch_hits >>= 1;
-    prefetch_fills >>= 1;
-    epoch_accesses = 0;
+    if (epochs % PRINT_EVERY == 0) print_stats("periodic");
 }
 
 void CACHE::l2c_initialize_replacement()
 {
-    cout << "Initialize prefetch-aware dynamic RRIP"
-         << " leaders=" << NUM_LEADERS
-         << " stride=" << LEADER_STRIDE
-         << " prefetch_threshold=" << PREFETCH_THRESHOLD
-         << "%" << endl;
+    cout << "Initialize dynamic I-RRIP (capped) for L2C: leaders=" << NUM_LEADERS
+         << " threshold=" << THRESH_PCT << "% epoch=" << EPOCH
+         << " instr_max_ways=" << INSTR_MAX_WAYS << endl;
 
-    for (uint32_t set = 0; set < L2C_SET; set++) {
-        for (uint32_t way = 0; way < L2C_WAY; way++) {
-            l2_rrpv[set][way] = MAX_RRPV;
-            l2_was_prefetch[set][way] = 0;
-        }
-    }
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
 
-    demand_hits = 0;
-    prefetch_hits = 0;
-    demand_accesses = 0;
-    prefetch_accesses = 0;
-    epoch_accesses = 0;
-
-    prefer_prefetch_victims = true;
-
-    mode_switches = 0;
-    prefetch_fills = 0;
-    useful_prefetch_hits = 0;
-    unused_prefetch_evictions = 0;
-    follower_fills_prefetch_mode = 0;
-    follower_fills_normal_mode = 0;
+    instr_acc = instr_miss = total_acc = total_miss = leader_events = 0;
+    epochs = epochs_irrip = mode_switches = last_ratio_pct = 0;
+    fills_irrip = fills_rrip = capped_evictions = 0;
+    irrip_mode = false;
 }
 
-uint32_t CACHE::l2c_find_victim(
-    uint32_t cpu,
-    uint64_t instr_id,
-    uint32_t set,
-    const BLOCK *current_set,
-    uint64_t ip,
-    uint64_t full_addr,
-    uint32_t type)
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                const BLOCK *current_set, uint64_t ip,
+                                uint64_t full_addr, uint32_t type)
 {
-    while (true) {
-        int first_candidate = -1;
-        int prefetch_candidate = -1;
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
 
-        for (uint32_t way = 0; way < L2C_WAY; way++) {
-            if (l2_rrpv[set][way] != MAX_RRPV)
-                continue;
+    // Protect instruction lines only in I-RRIP mode AND while they hold few ways.
+    // Above the cap, behave like plain RRIP so stale instruction lines can leave.
+    int n_instr = 0;
+    for (int i = 0; i < L2C_WAY; i++)
+        if (current_set[i].instruction) n_instr++;
 
-            if (first_candidate < 0)
-                first_candidate = way;
+    bool want_prot = use_irrip(set);
+    bool prot = want_prot && (n_instr <= INSTR_MAX_WAYS);
+    if (want_prot && !prot) capped_evictions++;
 
-            if (l2_was_prefetch[set][way] &&
-                prefetch_candidate < 0)
-                prefetch_candidate = way;
+    while (1) {
+        int first = -1, data_victim = -1, data_exists = 0;
+
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (!current_set[i].instruction) data_exists = 1;
+            if (l2_rrpv[set][i] != maxRRPV) continue;
+            if (first < 0) first = i;
+            if (!current_set[i].instruction && data_victim < 0) data_victim = i;
         }
 
-        if (prefer_prefetch_victims && prefetch_candidate >= 0)
-            return prefetch_candidate;
-
-        if (first_candidate >= 0)
-            return first_candidate;
-
-        for (uint32_t way = 0; way < L2C_WAY; way++) {
-            if (l2_rrpv[set][way] < MAX_RRPV)
-                l2_rrpv[set][way]++;
+        if (!prot) {
+            if (first >= 0) return first;
+        } else {
+            if (data_victim >= 0) return data_victim;
+            if (first >= 0 && !data_exists) return first;
         }
+
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
     }
+
+    assert(0);
+    return 0;
 }
 
-void CACHE::l2c_update_replacement_state(
-    uint32_t cpu,
-    uint32_t set,
-    uint32_t way,
-    uint64_t full_addr,
-    uint64_t ip,
-    uint64_t victim_addr,
-    uint32_t type,
-    uint8_t hit)
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                         uint64_t full_addr, uint64_t ip,
+                                         uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit)
 {
+    bool prot = use_irrip(set);
+
     if (type == WRITEBACK) {
-        if (!hit) {
-            l2_rrpv[set][way] = MAX_RRPV;
-            l2_was_prefetch[set][way] = 0;
-        }
+        if (!hit)
+            l2_rrpv[set][way] = DATA_INSERT_RRPV;
         return;
     }
 
-    bool is_prefetch = (type == PREFETCH);
+    bool is_instr;
+    if (hit) {
+        is_instr = block[set][way].instruction;
+    } else {
+        is_instr = false;     // fill: the packet is still in the MSHR at this point
+        if (MSHR.next_fill_index < MSHR.SIZE) {
+            const PACKET &p = MSHR.entry[MSHR.next_fill_index];
+            is_instr = p.instruction && (type == LOAD || type == PREFETCH);
+        }
+    }
 
+    // set dueling statistics come from leader sets (plain RRIP) only
     if (is_leader(set)) {
-        if (is_prefetch)
-            prefetch_accesses++;
-        else
-            demand_accesses++;
-
-        if (hit) {
-            if (is_prefetch)
-                prefetch_hits++;
-            else
-                demand_hits++;
+        total_acc++;
+        if (is_instr) instr_acc++;
+        if (!hit) {
+            total_miss++;
+            if (is_instr) instr_miss++;
         }
-
-        epoch_accesses++;
-
-        if (epoch_accesses >= EPOCH) {
-            update_mode();
-            epoch_accesses = 0;
-        }
+        if (++leader_events >= EPOCH)
+            decide_mode();
     }
 
     if (hit) {
-        if (l2_was_prefetch[set][way] && !is_prefetch) {
-            useful_prefetch_hits++;
-            l2_was_prefetch[set][way] = 0;
-        }
-
-        l2_rrpv[set][way] = 0;
-
+        l2_rrpv[set][way] = 0;                       // standard RRIP promotion
         return;
     }
 
-    if (l2_was_prefetch[set][way]) {
-        unused_prefetch_evictions++;
-        l2_was_prefetch[set][way] = 0;
-    }
-
-    if (is_prefetch) {
-        prefetch_fills++;
-        l2_was_prefetch[set][way] = 1;
-        l2_rrpv[set][way] = MAX_RRPV;
-    } else {
-        l2_was_prefetch[set][way] = 0;
-        l2_rrpv[set][way] = MAX_RRPV - 1;
-    }
-
     if (!is_leader(set)) {
-        if (prefer_prefetch_victims)
-            follower_fills_prefetch_mode++;
-        else
-            follower_fills_normal_mode++;
+        if (prot) fills_irrip++; else fills_rrip++;
     }
+
+    if (prot && is_instr)
+        l2_rrpv[set][way] = INSTR_INSERT_RRPV;
+    else
+        l2_rrpv[set][way] = DATA_INSERT_RRPV;
 }
 
 void CACHE::l2c_replacement_final_stats()
 {
-    cout << "PREFETCH_AWARE_DYNAMIC_RRIP"
-         << " mode_switches=" << mode_switches
-         << " prefetch_fills=" << prefetch_fills
-         << " useful_prefetch_hits=" << useful_prefetch_hits
-         << " unused_prefetch_evictions=" << unused_prefetch_evictions
-         << " follower_fills_prefetch_mode=" << follower_fills_prefetch_mode
-         << " follower_fills_normal_mode=" << follower_fills_normal_mode
-         << endl;
-} 
+    print_stats("final");
+}
